@@ -1,0 +1,8 @@
+/.venv
+/gestor_agentes.build
+/gestor_agentes.db
+/gestor_agentes.dist
+/gestor_agentes.spec
+/modelos
+/workspace
+/__pycache__

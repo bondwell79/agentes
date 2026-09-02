@@ -1,0 +1,2967 @@
+#!/usr/bin/env python3
+"""
+gestor_agentes.py
+
+Agente LLM Autónomo con Control de Permisos (HITL - Human-in-the-Loop).
+
+Desarrollado exclusivamente con la biblioteca estándar de Python (cero dependencias externas).
+
+Características:
+    - Gestión del ciclo de vida de tareas (PENDING, IN_PROGRESS, AWAITING_APPROVAL,
+      COMPLETED, FAILED, CANCELLED).
+    - Control de seguridad humano: validación manual de acciones sensibles.
+    - Trazabilidad completa: historial estructurado y auditable por tarea.
+    - Dashboard interactivo (tkinter) con 4 zonas:
+        1. Entrada de prompt + botón Ejecutar.
+        2. Tablero de tareas en 2 columnas (pendientes vs ejecutadas).
+        3. Registro de trazabilidad por tarea seleccionada.
+        4. Aviso emergente de aprobación (Permitir / Cancelar).
+    - Persistencia local en SQLite.
+    - Conector HTTP para LLMs compatibles con OpenAI / Ollama.
+
+Configuración mediante variables de entorno:
+    LLM_BASE_URL   - URL base del endpoint (por defecto: http://localhost:11434/v1)
+    LLM_API_KEY    - Clave de API (opcional para Ollama)
+    LLM_MODEL      - Modelo a utilizar (por defecto: llama3.2)
+    LLM_TIMEOUT    - Timeout en segundos (por defecto: 120)
+"""
+
+from __future__ import annotations
+
+import collections
+import configparser
+import json
+import os
+import queue
+import shlex
+import sqlite3
+import subprocess
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.request
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from tkinter import Canvas, Tk, StringVar, Text, Toplevel, ttk
+from tkinter.scrolledtext import ScrolledText
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+
+# ============================================================================
+# CONFIGURACIÓN (config.ini + variables de entorno)
+# ============================================================================
+
+CONFIG_PATH = os.environ.get("GESTOR_AGENTES_CONFIG", "config.ini")
+
+
+def _str_to_bool(value: str) -> bool:
+    """Convierte una cadena a booleano (true/1/yes -> True)."""
+    return value.strip().lower() in ("true", "1", "yes", "si", "sí", "on")
+
+
+class Config:
+    """
+    Carga la configuración desde config.ini con fallback a variables de entorno.
+
+    Prioridad (de mayor a menor):
+        1. Variables de entorno (GESTOR_AGENTES_* y LLM_*)
+        2. Fichero config.ini
+        3. Valores por defecto
+    """
+
+    DEFAULTS: Dict[str, Dict[str, str]] = {
+        "LLM": {
+            "mode": "local",
+            "base_url": "http://localhost:8080/v1",
+            "api_key": "",
+            "model": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+            "model_path": "modelos/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+            "timeout": "120",
+            "n_ctx": "8192",
+            "n_threads": "8",
+            "n_gpu_layers": "0",
+        },
+        "Workspace": {
+            "path": "./workspace",
+        },
+        "Database": {
+            "path": "gestor_agentes.db",
+        },
+        "Agent": {
+            "max_iterations": "10",
+            "loop_threshold": "5",
+        },
+        "UI": {
+            "fullscreen": "false",
+            "bg_color": "#f0f0f0",
+            "fg_color": "#1a1a1a",
+            "frame_bg": "#f5f5f5",
+            "card_bg": "#ffffff",
+            "prompt_bg": "#ffffff",
+            "prompt_fg": "#000000",
+            "history_bg": "#ffffff",
+            "history_fg": "#000000",
+            "approval_bg": "#fff4e1",
+            "approval_fg": "#5a3a00",
+            "approval_request_bg": "#ffffff",
+            "approval_request_fg": "#5a3a00",
+            "approval_granted_bg": "#ffffff",
+            "approval_granted_fg": "#388e3c",
+            "approval_denied_bg": "#ffffff",
+            "approval_denied_fg": "#d32f2f",
+            "final_answer_fg": "#4caf50",
+            "thought_fg": "#e65100",
+            "info_fg": "#fbc02d",
+            "tool_call_fg": "#4fc3f7",
+            "tool_result_fg": "#80cbc4",
+            "approval_request_fg": "#ffb74d",
+            "approval_granted_fg": "#66bb6a",
+            "approval_denied_fg": "#ef5350",
+            "error_fg": "#ef5350",
+            "status_change_fg": "#b0bec5",
+            "loop_detected_fg": "#ce93d8",
+            "context_compacted_fg": "#ce93d8",
+            "status_pending": "#9e9e9e",
+            "status_in_progress": "#1976d2",
+            "status_awaiting_approval": "#f57c00",
+            "status_completed": "#388e3c",
+            "status_failed": "#d32f2f",
+            "status_cancelled": "#616161",
+            "font_family": "Segoe UI",
+            "font_size": "10",
+            "mono_font_family": "Consolas",
+            "mono_font_size": "10",
+            "context_bar_bg": "#e0e0e0",
+            "context_bar_low": "#4caf50",
+            "context_bar_medium": "#ff9800",
+            "context_bar_high": "#f44336",
+        },
+    }
+
+    def __init__(self, path: str = CONFIG_PATH) -> None:
+        self._path = path
+        self._parser = configparser.ConfigParser()
+        # Cargar valores por defecto primero.
+        self._parser.read_dict(self.DEFAULTS)
+        # Sobrescribir con config.ini si existe.
+        if os.path.exists(path):
+            try:
+                self._parser.read(path, encoding="utf-8")
+            except configparser.Error as e:
+                print(f"[AVISO] Error leyendo {path}: {e}. Usando valores por defecto.")
+
+    # --- LLM ---
+
+    @property
+    def llm_base_url(self) -> str:
+        return os.environ.get(
+            "LLM_BASE_URL", self._parser.get("LLM", "base_url")
+        ).rstrip("/")
+
+    @property
+    def llm_api_key(self) -> str:
+        return os.environ.get("LLM_API_KEY", self._parser.get("LLM", "api_key"))
+
+    @property
+    def llm_model(self) -> str:
+        return os.environ.get("LLM_MODEL", self._parser.get("LLM", "model"))
+
+    @property
+    def llm_timeout(self) -> float:
+        env_val = os.environ.get("LLM_TIMEOUT")
+        if env_val:
+            return float(env_val)
+        return self._parser.getfloat("LLM", "timeout")
+
+    @property
+    def llm_mode(self) -> str:
+        env_val = os.environ.get("LLM_MODE")
+        if env_val:
+            return env_val.strip().lower()
+        return self._parser.get("LLM", "mode").strip().lower()
+
+    @property
+    def llm_model_path(self) -> str:
+        return os.environ.get("LLM_MODEL_PATH", self._parser.get("LLM", "model_path"))
+
+    @property
+    def llm_n_ctx(self) -> int:
+        env_val = os.environ.get("LLM_N_CTX")
+        if env_val:
+            return int(env_val)
+        return self._parser.getint("LLM", "n_ctx")
+
+    @property
+    def llm_n_threads(self) -> int:
+        env_val = os.environ.get("LLM_N_THREADS")
+        if env_val:
+            return int(env_val)
+        return self._parser.getint("LLM", "n_threads")
+
+    @property
+    def llm_n_gpu_layers(self) -> int:
+        env_val = os.environ.get("LLM_N_GPU_LAYERS")
+        if env_val:
+            return int(env_val)
+        return self._parser.getint("LLM", "n_gpu_layers")
+
+    # --- Workspace ---
+
+    @property
+    def workspace_path(self) -> str:
+        return os.environ.get(
+            "GESTOR_AGENTES_WORKSPACE", self._parser.get("Workspace", "path")
+        )
+
+    # --- Database ---
+
+    @property
+    def db_path(self) -> str:
+        return os.environ.get("GESTOR_AGENTES_DB", self._parser.get("Database", "path"))
+
+    # --- Agent ---
+
+    @property
+    def max_iterations(self) -> int:
+        env_val = os.environ.get("GESTOR_AGENTES_MAX_ITER")
+        if env_val:
+            return int(env_val)
+        return self._parser.getint("Agent", "max_iterations")
+
+    @property
+    def loop_threshold(self) -> int:
+        env_val = os.environ.get("GESTOR_AGENTES_LOOP_THRESHOLD")
+        if env_val:
+            return int(env_val)
+        return self._parser.getint("Agent", "loop_threshold")
+
+    # --- UI ---
+
+    @property
+    def ui_fullscreen(self) -> bool:
+        env_val = os.environ.get("GESTOR_AGENTES_FULLSCREEN")
+        if env_val is not None:
+            return _str_to_bool(env_val)
+        return self._parser.getboolean("UI", "fullscreen")
+
+    @property
+    def ui_bg_color(self) -> str:
+        return self._parser.get("UI", "bg_color")
+
+    @property
+    def ui_fg_color(self) -> str:
+        return self._parser.get("UI", "fg_color")
+
+    @property
+    def ui_frame_bg(self) -> str:
+        return self._parser.get("UI", "frame_bg")
+
+    @property
+    def ui_card_bg(self) -> str:
+        return self._parser.get("UI", "card_bg")
+
+    @property
+    def ui_prompt_bg(self) -> str:
+        return self._parser.get("UI", "prompt_bg")
+
+    @property
+    def ui_prompt_fg(self) -> str:
+        return self._parser.get("UI", "prompt_fg")
+
+    @property
+    def ui_history_bg(self) -> str:
+        return self._parser.get("UI", "history_bg")
+
+    @property
+    def ui_history_fg(self) -> str:
+        return self._parser.get("UI", "history_fg")
+
+    @property
+    def ui_approval_bg(self) -> str:
+        return self._parser.get("UI", "approval_bg")
+
+    @property
+    def ui_approval_fg(self) -> str:
+        return self._parser.get("UI", "approval_fg")
+
+    @property
+    def ui_approval_request_bg(self) -> str:
+        return self._parser.get("UI", "approval_request_bg")
+
+    @property
+    def ui_approval_request_fg(self) -> str:
+        return self._parser.get("UI", "approval_request_fg")
+
+    @property
+    def ui_approval_granted_bg(self) -> str:
+        return self._parser.get("UI", "approval_granted_bg")
+
+    @property
+    def ui_approval_granted_fg(self) -> str:
+        return self._parser.get("UI", "approval_granted_fg")
+
+    @property
+    def ui_approval_denied_bg(self) -> str:
+        return self._parser.get("UI", "approval_denied_bg")
+
+    @property
+    def ui_approval_denied_fg(self) -> str:
+        return self._parser.get("UI", "approval_denied_fg")
+
+    @property
+    def ui_final_answer_fg(self) -> str:
+        return self._parser.get("UI", "final_answer_fg")
+
+    @property
+    def ui_thought_fg(self) -> str:
+        return self._parser.get("UI", "thought_fg")
+
+    @property
+    def ui_info_fg(self) -> str:
+        return self._parser.get("UI", "info_fg")
+
+    @property
+    def ui_tool_call_fg(self) -> str:
+        return self._parser.get("UI", "tool_call_fg")
+
+    @property
+    def ui_tool_result_fg(self) -> str:
+        return self._parser.get("UI", "tool_result_fg")
+
+    @property
+    def ui_approval_request_fg(self) -> str:
+        return self._parser.get("UI", "approval_request_fg")
+
+    @property
+    def ui_approval_granted_fg(self) -> str:
+        return self._parser.get("UI", "approval_granted_fg")
+
+    @property
+    def ui_approval_denied_fg(self) -> str:
+        return self._parser.get("UI", "approval_denied_fg")
+
+    @property
+    def ui_error_fg(self) -> str:
+        return self._parser.get("UI", "error_fg")
+
+    @property
+    def ui_status_change_fg(self) -> str:
+        return self._parser.get("UI", "status_change_fg")
+
+    @property
+    def ui_loop_detected_fg(self) -> str:
+        return self._parser.get("UI", "loop_detected_fg")
+
+    @property
+    def ui_context_compacted_fg(self) -> str:
+        return self._parser.get("UI", "context_compacted_fg")
+
+    @property
+    def ui_status_pending(self) -> str:
+        return self._parser.get("UI", "status_pending")
+
+    @property
+    def ui_status_in_progress(self) -> str:
+        return self._parser.get("UI", "status_in_progress")
+
+    @property
+    def ui_status_awaiting_approval(self) -> str:
+        return self._parser.get("UI", "status_awaiting_approval")
+
+    @property
+    def ui_status_completed(self) -> str:
+        return self._parser.get("UI", "status_completed")
+
+    @property
+    def ui_status_failed(self) -> str:
+        return self._parser.get("UI", "status_failed")
+
+    @property
+    def ui_status_cancelled(self) -> str:
+        return self._parser.get("UI", "status_cancelled")
+
+    @property
+    def ui_font_family(self) -> str:
+        return self._parser.get("UI", "font_family")
+
+    @property
+    def ui_font_size(self) -> int:
+        return self._parser.getint("UI", "font_size")
+
+    @property
+    def ui_mono_font_family(self) -> str:
+        return self._parser.get("UI", "mono_font_family")
+
+    @property
+    def ui_mono_font_size(self) -> int:
+        return self._parser.getint("UI", "mono_font_size")
+
+    @property
+    def ui_context_bar_bg(self) -> str:
+        return self._parser.get("UI", "context_bar_bg")
+
+    @property
+    def ui_context_bar_low(self) -> str:
+        return self._parser.get("UI", "context_bar_low")
+
+    @property
+    def ui_context_bar_medium(self) -> str:
+        return self._parser.get("UI", "context_bar_medium")
+
+    @property
+    def ui_context_bar_high(self) -> str:
+        return self._parser.get("UI", "context_bar_high")
+
+
+# Instancia global de configuración.
+CONFIG = Config()
+
+# Aliases para compatibilidad con el resto del código.
+DB_PATH = CONFIG.db_path
+MAX_ITERATIONS = CONFIG.max_iterations
+LOOP_THRESHOLD = CONFIG.loop_threshold
+LLM_MODE = CONFIG.llm_mode
+LLM_BASE_URL = CONFIG.llm_base_url
+LLM_API_KEY = CONFIG.llm_api_key
+LLM_MODEL = CONFIG.llm_model
+LLM_MODEL_PATH = CONFIG.llm_model_path
+LLM_TIMEOUT = CONFIG.llm_timeout
+LLM_N_CTX = CONFIG.llm_n_ctx
+LLM_N_THREADS = CONFIG.llm_n_threads
+LLM_N_GPU_LAYERS = CONFIG.llm_n_gpu_layers
+
+# Directorio del script (para resolver rutas relativas como modelos/).
+SCRIPT_DIR = Path(__file__).parent.resolve()
+
+# Directorio de trabajo restringido para operaciones de archivos
+WORKSPACE_DIR = Path(CONFIG.workspace_path).resolve()
+WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================================
+# ENUMERACIONES
+# ============================================================================
+
+class TaskStatus(str, Enum):
+    """Estados posibles de una tarea."""
+    PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+    # Estados terminales: la tarea ya terminó (con éxito, fallo o cancelación)
+    # y NO deben borrarse en la limpieza de arranque.
+    TERMINAL_STATUSES = frozenset({COMPLETED, FAILED, CANCELLED})
+
+    @classmethod
+    def unfinished(cls) -> List["TaskStatus"]:
+        """Estados de tareas que NO han terminado y deben limpiarse al iniciar."""
+        return [s for s in cls if s not in cls.TERMINAL_STATUSES]  # type: ignore[attr-defined]  # noqa: F821
+
+
+class RiskLevel(str, Enum):
+    """Niveles de riesgo de una herramienta."""
+    SAFE = "SAFE"          # Lectura / consulta: ejecución automática.
+    CRITICAL = "CRITICAL"  # Escritura / comandos: requiere aprobación humana.
+
+
+class EventType(str, Enum):
+    """Tipos de evento registrados en el historial."""
+    THOUGHT = "thought"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    APPROVAL_REQUEST = "approval_request"
+    APPROVAL_GRANTED = "approval_granted"
+    APPROVAL_DENIED = "approval_denied"
+    FINAL_ANSWER = "final_answer"
+    ERROR = "error"
+    STATUS_CHANGE = "status_change"
+    INFO = "info"
+    LOOP_DETECTED = "loop_detected"
+    CONTEXT_COMPACTED = "context_compacted"
+
+
+# ============================================================================
+# MODELOS DE DATOS
+# ============================================================================
+
+@dataclass
+class Task:
+    """Representa una tarea del agente."""
+    id: Optional[int]
+    title: str
+    prompt: str
+    status: TaskStatus
+    created_at: str
+    updated_at: str
+    final_answer: Optional[str] = None
+
+
+@dataclass
+class HistoryEntry:
+    """Entrada del historial de una tarea."""
+    id: Optional[int]
+    task_id: int
+    timestamp: str
+    event_type: EventType
+    content: str
+
+
+@dataclass
+class ToolCall:
+    """Llamada a una herramienta solicitada por el LLM."""
+    id: str
+    name: str
+    arguments: Dict[str, Any]
+
+
+@dataclass
+class ToolResult:
+    """Resultado de la ejecución de una herramienta."""
+    tool_call_id: str
+    name: str
+    success: bool
+    output: str
+
+
+# ============================================================================
+# EXCEPCIONES DEL LLM
+# ============================================================================
+
+class LLMError(Exception):
+    """Error genérico del conector LLM (modo local o HTTP)."""
+
+
+# ============================================================================
+# CAPA DE PERSISTENCIA (SQLite)
+# ============================================================================
+
+class Database:
+    """Capa de persistencia SQLite para tareas e historial."""
+
+    def __init__(self, db_path: str = DB_PATH) -> None:
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _init_schema(self) -> None:
+        with self._lock, self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title        TEXT    NOT NULL,
+                    prompt       TEXT    NOT NULL,
+                    status       TEXT    NOT NULL,
+                    created_at   TEXT    NOT NULL,
+                    updated_at   TEXT    NOT NULL,
+                    final_answer TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS history (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id    INTEGER NOT NULL,
+                    timestamp  TEXT    NOT NULL,
+                    event_type TEXT    NOT NULL,
+                    content    TEXT    NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_history_task_id ON history(task_id);
+                CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks(status);
+                """
+            )
+
+    # --- Tareas ---
+
+    def create_task(self, title: str, prompt: str) -> Task:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO tasks (title, prompt, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (title, prompt, TaskStatus.PENDING.value, now, now),
+            )
+            task_id = cur.lastrowid
+        return Task(
+            id=task_id,
+            title=title,
+            prompt=prompt,
+            status=TaskStatus.PENDING,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def update_task_status(
+        self,
+        task_id: int,
+        status: TaskStatus,
+        final_answer: Optional[str] = None,
+    ) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            if final_answer is not None:
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ?, final_answer = ? "
+                    "WHERE id = ?",
+                    (status.value, now, final_answer, task_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (status.value, now, task_id),
+                )
+
+    def get_task(self, task_id: int) -> Optional[Task]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return None
+        return Task(
+            id=row["id"],
+            title=row["title"],
+            prompt=row["prompt"],
+            status=TaskStatus(row["status"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            final_answer=row["final_answer"],
+        )
+
+    def list_tasks(self, statuses: List[TaskStatus]) -> List[Task]:
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM tasks WHERE status IN ({placeholders}) "
+                f"ORDER BY updated_at DESC",
+                [s.value for s in statuses],
+            ).fetchall()
+        return [
+            Task(
+                id=r["id"],
+                title=r["title"],
+                prompt=r["prompt"],
+                status=TaskStatus(r["status"]),
+                created_at=r["created_at"],
+                updated_at=r["updated_at"],
+                final_answer=r["final_answer"],
+            )
+            for r in rows
+        ]
+
+    def delete_tasks_by_status(self, statuses: List[TaskStatus]) -> int:
+        """
+        Elimina las tareas que se encuentren en cualquiera de los estados indicados.
+
+        El historial asociado se borra en cascada por la FK de la tabla ``history``.
+        Retorna el número de filas eliminadas.
+        """
+        if not statuses:
+            return 0
+        placeholders = ",".join("?" for _ in statuses)
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                f"DELETE FROM tasks WHERE status IN ({placeholders})",
+                [s.value for s in statuses],
+            )
+            return cur.rowcount
+
+    # --- Historial ---
+
+    def add_history(
+        self,
+        task_id: int,
+        event_type: EventType,
+        content: str,
+    ) -> HistoryEntry:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO history (task_id, timestamp, event_type, content) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, now, event_type.value, content),
+            )
+            entry_id = cur.lastrowid
+        return HistoryEntry(
+            id=entry_id,
+            task_id=task_id,
+            timestamp=now,
+            event_type=event_type,
+            content=content,
+        )
+
+    def get_history(self, task_id: int) -> List[HistoryEntry]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM history WHERE task_id = ? ORDER BY id ASC",
+                (task_id,),
+            ).fetchall()
+        return [
+            HistoryEntry(
+                id=r["id"],
+                task_id=r["task_id"],
+                timestamp=r["timestamp"],
+                event_type=EventType(r["event_type"]),
+                content=r["content"],
+            )
+            for r in rows
+        ]
+
+
+# ============================================================================
+# CONECTOR LLM (HTTP + local con llama-cpp-python)
+# ============================================================================
+
+class LLMConnector:
+    """
+    Cliente para LLMs con dos modos de operación:
+
+    - "local": carga un modelo GGUF directamente con llama-cpp-python
+      (sin endpoint HTTP, inferencia en proceso).
+    - "http": envía solicitudes a un endpoint compatible con
+      /v1/chat/completions (OpenAI / Ollama / llama.cpp server).
+
+    El modo se selecciona con el parámetro `mode` (o la clave
+    `mode` en la sección [LLM] de config.ini).
+    En ambos casos la respuesta es compatible con OpenAI
+    (choices[0].message.content / tool_calls), por lo que
+    `parse_assistant_message` funciona sin cambios.
+    """
+
+    _VALID_MODES = ("local", "http")
+
+    def __init__(
+        self,
+        mode: str = LLM_MODE,
+        base_url: str = LLM_BASE_URL,
+        api_key: str = LLM_API_KEY,
+        model: str = LLM_MODEL,
+        model_path: str = LLM_MODEL_PATH,
+        timeout: float = LLM_TIMEOUT,
+        n_ctx: int = LLM_N_CTX,
+        n_threads: int = LLM_N_THREADS,
+        n_gpu_layers: int = LLM_N_GPU_LAYERS,
+    ) -> None:
+        self.mode = mode.strip().lower()
+        if self.mode not in self._VALID_MODES:
+            raise LLMError(
+                f"Modo LLM inválido: '{mode}'. Válidos: {self._VALID_MODES}"
+            )
+        self.base_url = base_url
+        self.api_key = api_key
+        self.model = model
+        self.model_path = model_path
+        self.timeout = timeout
+        self.n_ctx = n_ctx
+        self.n_threads = n_threads
+        self.n_gpu_layers = n_gpu_layers
+        self._local_llm = None
+        # Lock para serializar llamadas al LLM. llama-cpp-python NO es
+        # thread-safe: su contexto interno se corrompe si dos hilos llaman
+        # a create_chat_completion() a la vez (provoca el error
+        # "GGML_ASSERT(i1 >= 0 && i1 < ne1) failed"). Con este lock,
+        # las llamadas al LLM se ejecutan una tras otra, aunque las
+        # tareas sigan corriendo en paralelo en otros aspectos
+        # (ejecución de herramientas, escritura en BD, etc.).
+        self._lock = threading.Lock()
+
+        if self.mode == "local":
+            self._init_local()
+
+    # --- Backend local (llama-cpp-python) ---
+
+    def _resolve_model_file(self) -> Path:
+        """Resuelve la ruta del modelo .gguf (absoluta)."""
+        p = Path(self.model_path)
+        if not p.is_absolute():
+            p = SCRIPT_DIR / p
+        return p.resolve()
+
+    def _init_local(self) -> None:
+        """Carga el modelo GGUF en memoria con llama-cpp-python."""
+        try:
+            from llama_cpp import Llama  # type: ignore
+        except ImportError as e:
+            raise LLMError(
+                "llama-cpp-python no está instalado. "
+                "Instálalo con: pip install llama-cpp-python"
+            ) from e
+
+        model_file = self._resolve_model_file()
+        if not model_file.exists():
+            raise LLMError(
+                f"Archivo de modelo no encontrado: {model_file}. "
+                f"Colócalo en la ruta indicada por 'model_path' en config.ini."
+            )
+
+        try:
+            self._local_llm = Llama(
+                model_path=str(model_file),
+                n_ctx=self.n_ctx,
+                n_threads=self.n_threads,
+                n_gpu_layers=self.n_gpu_layers,
+                verbose=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise LLMError(f"Error cargando modelo {model_file}: {e}") from e
+
+    def _chat_local(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: Optional[str],
+    ) -> Dict[str, Any]:
+        """Inferencia local usando llama-cpp-python."""
+        if self._local_llm is None:
+            self._init_local()
+        kwargs: Dict[str, Any] = {"messages": messages}
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice or "auto"
+        try:
+            result = self._local_llm.create_chat_completion(**kwargs)
+        except Exception as e:  # noqa: BLE001
+            raise LLMError(f"Error en inferencia local: {e}") from e
+        # llama-cpp-python devuelve un dict estilo OpenAI.
+        if isinstance(result, dict):
+            return result
+        try:
+            return dict(result)
+        except Exception as e:  # noqa: BLE001
+            raise LLMError(f"Respuesta local en formato inesperado: {e}") from e
+
+    # --- Backend HTTP (OpenAI / Ollama / llama.cpp server) ---
+
+    def _chat_http(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: Optional[str],
+    ) -> Dict[str, Any]:
+        """Envía una solicitud HTTP al endpoint y devuelve la respuesta cruda."""
+        url = f"{self.base_url}/chat/completions"
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+        }
+        if tools:
+            payload["tools"] = tools
+            # Forzar al modelo a usar herramientas cuando estén disponibles.
+            # "auto" deja al modelo decidir; "required" fuerza al menos una.
+            payload["tool_choice"] = tool_choice or "auto"
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}),
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read().decode("utf-8")
+                return json.loads(body)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            raise LLMError(f"HTTP {e.code} desde {url}: {detail}") from e
+        except urllib.error.URLError as e:
+            raise LLMError(f"No se pudo conectar con {url}: {e.reason}") from e
+        except json.JSONDecodeError as e:
+            raise LLMError(f"Respuesta JSON inválida del LLM: {e}") from e
+
+    # --- Dispatcher ---
+
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Envía una solicitud de chat y devuelve la respuesta cruda.
+
+        Delega al backend local o HTTP según `self.mode`. En ambos casos
+        el formato de respuesta es compatible con OpenAI
+        (choices[0].message.content / tool_calls).
+
+        Las llamadas se serializan con un lock porque llama-cpp-python
+        no es thread-safe (ver nota en __init__).
+        """
+        with self._lock:
+            if self.mode == "local":
+                return self._chat_local(messages, tools, tool_choice)
+            return self._chat_http(messages, tools, tool_choice)
+
+    @staticmethod
+    def _extract_tool_calls_from_text(
+        content: str,
+    ) -> Tuple[str, List[ToolCall]]:
+        """
+        Extrae tool_calls del texto cuando el modelo los emite como
+        bloques ``<tool_call>{...}</tool_call>`` en lugar del campo
+        estructurado ``tool_calls`` (común en Qwen3-Instruct y otros
+        modelos que no usan el formato OpenAI nativo).
+
+        Devuelve (contenido_limpio, tool_calls). Los bloques que no se
+        puedan parsear como JSON se conservan en el contenido.
+        """
+        tool_calls: List[ToolCall] = []
+        cleaned_parts: List[str] = []
+        pos = 0
+        open_tag = "<tool_call>"
+        close_tag = "</tool_call>"
+
+        while True:
+            start = content.find(open_tag, pos)
+            if start == -1:
+                cleaned_parts.append(content[pos:])
+                break
+            # Texto previo al bloque: se conserva tal cual.
+            cleaned_parts.append(content[pos:start])
+            end = content.find(close_tag, start)
+            if end == -1:
+                # Sin cierre: dejar el resto intacto y abortar.
+                cleaned_parts.append(content[start:])
+                break
+            inner = content[start + len(open_tag):end].strip()
+            try:
+                payload = json.loads(inner)
+            except json.JSONDecodeError:
+                # No es JSON válido: conservar el bloque en el contenido.
+                cleaned_parts.append(content[start:end + len(close_tag)])
+                pos = end + len(close_tag)
+                continue
+            name = payload.get("name", "") if isinstance(payload, dict) else ""
+            args = payload.get("arguments", {}) if isinstance(payload, dict) else {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {"_raw": args}
+            elif not isinstance(args, dict):
+                args = {}
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    name=name,
+                    arguments=args,
+                )
+            )
+            pos = end + len(close_tag)
+
+        cleaned = "".join(cleaned_parts).strip()
+        return cleaned, tool_calls
+
+    @staticmethod
+    def parse_assistant_message(raw: Dict[str, Any]) -> Tuple[str, List[ToolCall]]:
+        """
+        Extrae contenido textual y tool_calls del mensaje del asistente.
+
+        Soporta dos formatos de tool_calls:
+            1. Estructurado OpenAI: ``message.tool_calls`` (lista de objetos).
+            2. Texto plano: bloques ``<tool_call>{...}</tool_call>`` dentro
+               de ``message.content`` (Qwen3-Instruct y similares).
+
+        Devuelve (content, tool_calls). Si el LLM no devuelve tool_calls
+        en ninguno de los dos formatos, se devuelve una lista vacía.
+        """
+        try:
+            choice = raw["choices"][0]
+            message = choice.get("message", {})
+        except (KeyError, IndexError) as e:
+            raise LLMError(f"Respuesta LLM sin 'choices[0].message': {raw}") from e
+
+        # Validar que el mensaje no esté vacío: si el LLM devuelve
+        # {"choices": [{}]} sin message, es una respuesta estructuralmente
+        # inválida que debe tratarse como error, no como respuesta vacía.
+        if not message:
+            raise LLMError(f"Respuesta LLM con 'message' vacío: {raw}")
+
+        content = message.get("content") or ""
+        raw_calls = message.get("tool_calls") or []
+        tool_calls: List[ToolCall] = []
+        for tc in raw_calls:
+            try:
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                args_raw = fn.get("arguments", "{}")
+                if isinstance(args_raw, str):
+                    try:
+                        args = json.loads(args_raw)
+                    except json.JSONDecodeError:
+                        args = {"_raw": args_raw}
+                else:
+                    # Normalizar tipos incorrectos (lista, int, bool, None)
+                    # a dict vacío para evitar pasar valores no-dict al tool.
+                    args = args_raw if isinstance(args_raw, dict) else {}
+                tool_calls.append(
+                    ToolCall(
+                        id=tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                        name=name,
+                        arguments=args,
+                    )
+                )
+            except Exception as e:  # noqa: BLE001
+                raise LLMError(f"Tool call malformado: {tc} ({e})") from e
+
+        # Fallback: si no hay tool_calls estructurados, buscar en el texto.
+        if not tool_calls and content:
+            content, text_calls = LLMConnector._extract_tool_calls_from_text(content)
+            tool_calls = text_calls
+
+        return content, tool_calls
+
+
+# ============================================================================
+# HERRAMIENTAS (TOOLS)
+# ============================================================================
+
+@dataclass
+class ToolDefinition:
+    """Definición de una herramienta: esquema, riesgo y ejecutor."""
+    name: str
+    description: str
+    risk: RiskLevel
+    parameters: Dict[str, Any]
+    runner: Callable[[Dict[str, Any]], str]
+
+
+def _resolve_workspace_path(path: str) -> Path:
+    """
+    Resuelve una ruta restringiéndola al directorio de trabajo.
+    Lanza ValueError si se intenta escapar del workspace.
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        p = WORKSPACE_DIR / p
+    resolved = p.resolve()
+    try:
+        resolved.relative_to(WORKSPACE_DIR)
+    except ValueError as e:
+        raise ValueError(
+            f"Ruta fuera del workspace permitido ({WORKSPACE_DIR}): {resolved}"
+        ) from e
+    return resolved
+
+
+def tool_read_file(args: Dict[str, Any]) -> str:
+    path = _resolve_workspace_path(args.get("path", ""))
+    if not path.exists():
+        return f"ERROR: el archivo no existe: {path}"
+    if not path.is_file():
+        return f"ERROR: no es un archivo: {path}"
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR al leer {path}: {e}"
+    if len(content) > 50_000:
+        content = content[:50_000] + "\n... [truncado]"
+    return content
+
+
+def tool_list_directory(args: Dict[str, Any]) -> str:
+    path = _resolve_workspace_path(args.get("path", "."))
+    if not path.exists():
+        return f"ERROR: el directorio no existe: {path}"
+    if not path.is_dir():
+        return f"ERROR: no es un directorio: {path}"
+    try:
+        entries = sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR al listar {path}: {e}"
+    lines = []
+    for entry in entries:
+        kind = "DIR " if entry.is_dir() else "FILE"
+        try:
+            size = entry.stat().st_size if entry.is_file() else "-"
+        except OSError:
+            size = "-"
+        lines.append(f"{kind}  {size:>8}  {entry.name}")
+    return "\n".join(lines) if lines else "(directorio vacío)"
+
+
+def tool_search_files(args: Dict[str, Any]) -> str:
+    pattern = args.get("pattern", "")
+    base = _resolve_workspace_path(args.get("path", "."))
+    if not pattern:
+        return "ERROR: 'pattern' es obligatorio"
+    if not base.exists() or not base.is_dir():
+        return f"ERROR: directorio inválido: {base}"
+    matches: List[str] = []
+    try:
+        for p in base.rglob(pattern):
+            try:
+                rel = p.relative_to(WORKSPACE_DIR)
+            except ValueError:
+                rel = p
+            matches.append(str(rel))
+            if len(matches) >= 200:
+                matches.append("... [truncado, más de 200 coincidencias]")
+                break
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR al buscar: {e}"
+    return "\n".join(matches) if matches else "(sin coincidencias)"
+
+
+def tool_get_current_time(_args: Dict[str, Any]) -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def tool_write_file(args: Dict[str, Any]) -> str:
+    path = _resolve_workspace_path(args.get("path", ""))
+    content = args.get("content", "")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR al escribir {path}: {e}"
+    return f"OK: escrito {len(content)} caracteres en {path}"
+
+
+def tool_execute_command(args: Dict[str, Any]) -> str:
+    """
+    Ejecuta un comando del sistema de forma restringida al workspace.
+    Se aplica una lista de denegación para comandos peligrosos.
+    """
+    command = args.get("command", "")
+    if not command:
+        return "ERROR: 'command' es obligatorio"
+
+    # Lista de denegación básica de comandos destructivos.
+    denied = ["rm -rf /", "format", "del /f /s /q", "shutdown", "reboot"]
+    lowered = command.lower()
+    for d in denied:
+        if d in lowered:
+            return f"ERROR: comando bloqueado por política de seguridad: '{d}'"
+
+    try:
+        # cwd restringido al workspace.
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=str(WORKSPACE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return "ERROR: timeout (30s) ejecutando el comando"
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR al ejecutar comando: {e}"
+
+    out = (result.stdout or "") + (result.stderr or "")
+    if not out:
+        out = f"(sin salida) código={result.returncode}"
+    if len(out) > 20_000:
+        out = out[:20_000] + "\n... [truncado]"
+    return out
+
+
+def tool_delete_file(args: Dict[str, Any]) -> str:
+    path = _resolve_workspace_path(args.get("path", ""))
+    if not path.exists():
+        return f"ERROR: no existe: {path}"
+    try:
+        if path.is_dir():
+            import shutil
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR al eliminar {path}: {e}"
+    return f"OK: eliminado {path}"
+
+
+class ToolsRegistry:
+    """Registro central de herramientas disponibles para el agente."""
+
+    def __init__(self) -> None:
+        self._tools: Dict[str, ToolDefinition] = {}
+        self._register_defaults()
+
+    def _register_defaults(self) -> None:
+        self.register(
+            ToolDefinition(
+                name="read_file",
+                description=(
+                    "Lee el contenido de un archivo de texto dentro del workspace. "
+                    "Argumentos: path (ruta relativa al workspace o absoluta)."
+                ),
+                risk=RiskLevel.SAFE,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Ruta del archivo a leer.",
+                        }
+                    },
+                    "required": ["path"],
+                },
+                runner=tool_read_file,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="list_directory",
+                description=(
+                    "Lista el contenido de un directorio del workspace. "
+                    "Argumentos: path (directorio, por defecto el workspace raíz)."
+                ),
+                risk=RiskLevel.SAFE,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Ruta del directorio a listar.",
+                        }
+                    },
+                },
+                runner=tool_list_directory,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="search_files",
+                description=(
+                    "Busca archivos por patrón (glob) dentro de un directorio. "
+                    "Argumentos: pattern (obligatorio), path (opcional)."
+                ),
+                risk=RiskLevel.SAFE,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Patrón glob, p. ej. '*.txt'.",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Directorio base de búsqueda.",
+                        },
+                    },
+                    "required": ["pattern"],
+                },
+                runner=tool_search_files,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="get_current_time",
+                description="Devuelve la fecha y hora UTC actuales en formato ISO 8601.",
+                risk=RiskLevel.SAFE,
+                parameters={"type": "object", "properties": {}},
+                runner=tool_get_current_time,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="write_file",
+                description=(
+                    "Escribe contenido en un archivo del workspace (crea "
+                    "directorios si no existen). Argumentos: path, content."
+                ),
+                risk=RiskLevel.CRITICAL,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Ruta del archivo a escribir.",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Contenido a escribir.",
+                        },
+                    },
+                    "required": ["path", "content"],
+                },
+                runner=tool_write_file,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="execute_command",
+                description=(
+                    "Ejecuta un comando del sistema dentro del workspace. "
+                    "Argumentos: command (cadena con el comando)."
+                ),
+                risk=RiskLevel.CRITICAL,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Comando a ejecutar.",
+                        }
+                    },
+                    "required": ["command"],
+                },
+                runner=tool_execute_command,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="delete_file",
+                description=(
+                    "Elimina un archivo o directorio del workspace. "
+                    "Argumentos: path."
+                ),
+                risk=RiskLevel.CRITICAL,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Ruta a eliminar.",
+                        }
+                    },
+                    "required": ["path"],
+                },
+                runner=tool_delete_file,
+            )
+        )
+
+    def register(self, tool: ToolDefinition) -> None:
+        self._tools[tool.name] = tool
+
+    def get(self, name: str) -> Optional[ToolDefinition]:
+        return self._tools.get(name)
+
+    def all(self) -> List[ToolDefinition]:
+        return list(self._tools.values())
+
+    def to_openai_tools(self) -> List[Dict[str, Any]]:
+        """Convierte el registro al formato OpenAI/Ollama de tools."""
+        out: List[Dict[str, Any]] = []
+        for t in self.all():
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    },
+                }
+            )
+        return out
+
+
+# ============================================================================
+# GESTOR DE PERMISOS (HITL)
+# ============================================================================
+
+class PermissionDecision:
+    """Resultado de una solicitud de permiso."""
+
+    def __init__(self, granted: bool, reason: str = "") -> None:
+        self.granted = granted
+        self.reason = reason
+
+
+class PermissionManager:
+    """
+    Gestor de aprobaciones humanas.
+
+    Las herramientas SAFE se ejecutan automáticamente.
+    Las herramientas CRITICAL bloquean la tarea hasta que el usuario
+    autorice o deniegue la operación.
+    """
+
+    def __init__(self, ui_queue: "queue.Queue[Dict[str, Any]]") -> None:
+        self._ui_queue = ui_queue
+        self._events: Dict[str, "threading.Event"] = {}
+        self._decisions: Dict[str, PermissionDecision] = {}
+        self._lock = threading.Lock()
+
+    def request(
+        self,
+        task_id: int,
+        tool: ToolDefinition,
+        arguments: Dict[str, Any],
+    ) -> PermissionDecision:
+        """
+        Solicita aprobación humana para una herramienta CRITICAL.
+
+        Publica un evento en la cola de la UI y espera la decisión.
+        """
+        request_id = uuid.uuid4().hex
+        event = threading.Event()
+        with self._lock:
+            self._events[request_id] = event
+            self._decisions[request_id] = PermissionDecision(False, "pendiente")
+
+        self._ui_queue.put(
+            {
+                "type": "approval_request",
+                "request_id": request_id,
+                "task_id": task_id,
+                "tool_name": tool.name,
+                "tool_description": tool.description,
+                "risk": tool.risk.value,
+                "arguments": arguments,
+            }
+        )
+
+        # Espera síncrona hasta que la UI resuelva la aprobación.
+        event.wait(timeout=600)  # 10 minutos máximo.
+
+        with self._lock:
+            decision = self._decisions.pop(request_id, PermissionDecision(False, "timeout"))
+            self._events.pop(request_id, None)
+        return decision
+
+    def resolve(self, request_id: str, granted: bool, reason: str = "") -> None:
+        """Resuelve una solicitud de permiso (invocado por la UI)."""
+        with self._lock:
+            event = self._events.get(request_id)
+            decision = self._decisions.get(request_id)
+        if event is None or decision is None:
+            return
+        decision.granted = granted
+        decision.reason = reason
+        event.set()
+
+
+# ============================================================================
+# DETECTOR DE BUCLES
+# ============================================================================
+
+class LoopDetector:
+    """
+    Detecta cuando el modelo estÃ¡ repitiendo la misma respuesta.
+
+    Genera una huella estable (fingerprint) de cada mensaje del asistente
+    combinando el contenido textual normalizado y la firma de las
+    tool_calls (nombre + argumentos ordenados). Cuando la misma huella
+    aparece un nÃºmero de veces igual o superior al umbral, se considera
+    que el modelo estÃ¡ atrapado en un bucle y se debe compactar el
+    contexto para permitirle replantear la estrategia.
+    """
+
+    def __init__(self, threshold: int = LOOP_THRESHOLD) -> None:
+        self.threshold = max(1, int(threshold))
+        self._counts: Dict[str, int] = {}
+
+    @staticmethod
+    def fingerprint(content: str, tool_calls: List[ToolCall]) -> str:
+        """
+        Genera una huella estable para una respuesta del asistente.
+
+        - Normaliza el contenido (strip).
+        - Ordena los argumentos de cada tool_call para que el orden
+          de las claves no afecte a la huella.
+        - Incluye el nombre de la herramienta.
+        """
+        norm_content = (content or "").strip()
+        tc_parts: List[str] = []
+        for tc in tool_calls:
+            try:
+                args_repr = json.dumps(
+                    tc.arguments, sort_keys=True, ensure_ascii=False
+                )
+            except (TypeError, ValueError):
+                args_repr = repr(tc.arguments)
+            tc_parts.append(f"{tc.name}|{args_repr}")
+        return f"C:{norm_content}|TC:{','.join(tc_parts)}"
+
+    def record(self, content: str, tool_calls: List[ToolCall]) -> int:
+        """
+        Registra una respuesta y devuelve el contador actual para su huella.
+
+        Un contador >= self.threshold indica que la respuesta se ha
+        repetido suficientes veces como para considerarla un bucle.
+        """
+        fp = self.fingerprint(content, tool_calls)
+        self._counts[fp] = self._counts.get(fp, 0) + 1
+        return self._counts[fp]
+
+    def is_looping(self, content: str, tool_calls: List[ToolCall]) -> bool:
+        """
+        Devuelve True si la respuesta actual forma parte de un bucle
+        (contador >= umbral) sin incrementarlo.
+        """
+        fp = self.fingerprint(content, tool_calls)
+        return self._counts.get(fp, 0) >= self.threshold
+
+    def reset(self) -> None:
+        """Reinicia el detector (p.ej. tras una compactaciÃ³n de contexto)."""
+        self._counts.clear()
+
+
+# ============================================================================
+# MOTOR DEL AGENTE (ReAct)
+# ============================================================================
+
+SYSTEM_PROMPT = """Eres un agente autónomo con acceso a HERRAMIENTAS (tools/functions). Tienes permiso y DEBES usarlas cuando la tarea lo requiera.
+
+HERRAMIENTAS DISPONIBLES:
+- read_file(path): Lee el contenido de un archivo del workspace.
+- write_file(path, content): Escribe contenido en un archivo del workspace.
+- list_directory(path): Lista el contenido de un directorio del workspace.
+- search_files(pattern, path): Busca archivos por patrón glob.
+- execute_command(command): Ejecuta un comando del sistema dentro del workspace.
+- delete_file(path): Elimina un archivo o directorio del workspace.
+- get_current_time(): Devuelve la fecha y hora UTC actuales.
+
+REGLAS OBLIGATORIAS:
+1. SIEMPRE que el usuario pida crear, escribir, modificar, leer o buscar archivos, DEBES llamar a la herramienta correspondiente. NO respondas con texto diciendo que no puedes hacerlo.
+2. NO inventes código en tu respuesta. USA write_file para guardar código en archivos.
+3. NO digas "no tengo acceso" o "no puedo crear archivos". TIENES ACCESO a través de las herramientas.
+4. Cuando llames a una herramienta, el sistema te devolverá el resultado automáticamente.
+5. Después de obtener los resultados de las herramientas, proporciona una respuesta final concisa SIN tool_calls.
+6. Si una herramienta falla, intenta otra estrategia o explica el problema brevemente.
+7. Sé claro y breve en tus razonamientos.
+
+FORMATO DE RESPUESTA:
+- Si necesitas actuar: emite una o más tool_calls.
+- Si ya tienes la respuesta final: responde solo con texto, sin tool_calls.
+"""
+
+
+class Agent:
+    """
+    Bucle de razonamiento del agente (estilo ReAct).
+
+    Mantiene el historial de mensajes por tarea, llama al LLM,
+    ejecuta herramientas (con control HITL) y registra cada paso.
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        llm: LLMConnector,
+        tools: ToolsRegistry,
+        permissions: PermissionManager,
+        ui_queue: "queue.Queue[Dict[str, Any]]",
+    ) -> None:
+        self.db = db
+        self.llm = llm
+        self.tools = tools
+        self.permissions = permissions
+        self.ui_queue = ui_queue
+
+    # --- Helpers de logging ---
+
+    def _log(
+        self,
+        task_id: int,
+        event_type: EventType,
+        content: str,
+    ) -> None:
+        self.db.add_history(task_id, event_type, content)
+        self.ui_queue.put(
+            {
+                "type": "history_update",
+                "task_id": task_id,
+                "event_type": event_type.value,
+                "content": content,
+            }
+        )
+
+    def _set_status(
+        self,
+        task_id: int,
+        status: TaskStatus,
+        final_answer: Optional[str] = None,
+    ) -> None:
+        self.db.update_task_status(task_id, status, final_answer=final_answer)
+        self.ui_queue.put(
+            {"type": "status_change", "task_id": task_id, "status": status.value}
+        )
+        self._log(
+            task_id,
+            EventType.STATUS_CHANGE,
+            f"Estado de la tarea → {status.value}",
+        )
+
+    # --- Compactación de contexto ---
+
+    def _compact_context(
+        self,
+        task_id: int,
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Compacta el historial de mensajes cuando se detecta un bucle.
+
+        Conserva el system prompt y el prompt original del usuario, y
+        reemplaza todos los mensajes intermedios por un único mensaje
+        de resumen que incluye las últimas llamadas a herramientas y
+        sus resultados. Esto le da al modelo un contexto reducido pero
+        con la información esencial para replantear su estrategia y
+        salir del bucle.
+        """
+        if len(messages) <= 2:
+            return messages
+
+        system_msg = messages[0]
+        user_msg = messages[1]
+        middle = messages[2:]
+
+        summary_lines: List[str] = [
+            "CONTEXTO COMPACTADO: Se detectó un bucle en tus respuestas anteriores.",
+            "A continuación se resume el progreso realizado hasta ahora:",
+            "",
+        ]
+
+        # Extraer las últimas interacciones (pensamientos, tools, resultados).
+        recent_thoughts: List[str] = []
+        recent_tool_calls: List[str] = []
+        recent_results: List[str] = []
+        for msg in middle:
+            role = msg.get("role", "")
+            if role == "assistant":
+                content = (msg.get("content") or "").strip()
+                if content:
+                    recent_thoughts.append(content[:200])
+                for tc in msg.get("tool_calls", []) or []:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    name = fn.get("name", "?")
+                    args = fn.get("arguments", "{}")
+                    if isinstance(args, str) and len(args) > 120:
+                        args = args[:120] + "..."
+                    recent_tool_calls.append(f"  - {name}({args})")
+            elif role == "tool":
+                content = (msg.get("content") or "").strip()
+                if content:
+                    recent_results.append(content[:200])
+
+        if recent_thoughts:
+            summary_lines.append("Últimos pensamientos:")
+            summary_lines.extend(f"  - {t}" for t in recent_thoughts[-3:])
+            summary_lines.append("")
+        if recent_tool_calls:
+            summary_lines.append("Últimas herramientas llamadas:")
+            summary_lines.extend(recent_tool_calls[-5:])
+            summary_lines.append("")
+        if recent_results:
+            summary_lines.append("Últimos resultados:")
+            summary_lines.extend(f"  - {r}" for r in recent_results[-5:])
+            summary_lines.append("")
+
+        summary_lines.append(
+            "IMPORTANTE: Estás atrapado en un bucle. Cambia tu estrategia "
+            "completamente. Si una herramienta falla, prueba con otra "
+            "diferente o con argumentos distintos. Si no puedes avanzar, "
+            "proporciona una respuesta final explicando qué has logrado "
+            "y qué no has podido completar."
+        )
+
+        summary_msg = {
+            "role": "user",
+            "content": "\n".join(summary_lines),
+        }
+
+        self._log(
+            task_id,
+            EventType.LOOP_DETECTED,
+            (
+                f"♻ Bucle detectado: la misma respuesta se ha repetido "
+                f"{LOOP_THRESHOLD} o más veces. Iniciando compactación "
+                f"del contexto."
+            ),
+        )
+        self._log(
+            task_id,
+            EventType.CONTEXT_COMPACTED,
+            (
+                f"Contexto compactado: {len(messages)} mensajes → "
+                f"3 mensajes (system + user + resumen)."
+            ),
+        )
+
+        return [system_msg, user_msg, summary_msg]
+
+    # --- Ejecución de tool calls ---
+
+    def _execute_tool_call(
+        self,
+        task_id: int,
+        call: ToolCall,
+    ) -> ToolResult:
+        tool = self.tools.get(call.name)
+        if tool is None:
+            msg = f"ERROR: herramienta desconocida '{call.name}'"
+            self._log(task_id, EventType.ERROR, msg)
+            return ToolResult(call.id, call.name, False, msg)
+
+        # Permiso humano si es crítica.
+        if tool.risk == RiskLevel.CRITICAL:
+            self._set_status(task_id, TaskStatus.AWAITING_APPROVAL)
+            self._log(
+                task_id,
+                EventType.APPROVAL_REQUEST,
+                (
+                    f"Solicitud de aprobación para herramienta CRITICAL "
+                    f"'{tool.name}' con argumentos: {json.dumps(call.arguments, ensure_ascii=False)}"
+                ),
+            )
+            decision = self.permissions.request(task_id, tool, call.arguments)
+            if not decision.granted:
+                self._log(
+                    task_id,
+                    EventType.APPROVAL_DENIED,
+                    f"Acción denegada por el usuario: {tool.name}. "
+                    f"Motivo: {decision.reason or 'no especificado'}",
+                )
+                self._set_status(task_id, TaskStatus.IN_PROGRESS)
+                return ToolResult(
+                    call.id,
+                    call.name,
+                    False,
+                    f"DENEGADO por el usuario. {decision.reason or ''}".strip(),
+                )
+            self._log(
+                task_id,
+                EventType.APPROVAL_GRANTED,
+                f"Acción aprobada por el usuario: {tool.name}",
+            )
+            self._set_status(task_id, TaskStatus.IN_PROGRESS)
+
+        # Ejecución.
+        try:
+            output = tool.runner(call.arguments)
+            success = not output.startswith("ERROR")
+        except ValueError as e:
+            # Aviso de validación (p.ej. ruta fuera del workspace).
+            # Se envía al modelo como información, no como error de ejecución,
+            # para que reformule la petición con una ruta válida.
+            output = (
+                f"AVISO: {e}. "
+                f"Solo puedes acceder a rutas dentro del workspace permitido: "
+                f"{WORKSPACE_DIR}. "
+                f"Por favor, reformula tu petición usando una ruta válida "
+                f"relativa al workspace (por ejemplo, 'mi_archivo.txt' o "
+                f"'subdirectorio/mi_archivo.txt') y vuelve a intentarlo."
+            )
+            success = False
+        except Exception as e:  # noqa: BLE001
+            # Cualquier otro error de ejecución se convierte en aviso limpio
+            # para el modelo, sin traceback en la UI, con guía correctiva.
+            error_type = type(e).__name__
+            output = (
+                f"AVISO: la herramienta '{tool.name}' no pudo completarse "
+                f"({error_type}: {e}). "
+                f"Revisa los argumentos proporcionados y reformula tu petición. "
+                f"Si el problema persiste, prueba con una estrategia alternativa "
+                f"o con argumentos diferentes."
+            )
+            success = False
+
+        # En la UI, cualquier resultado no exitoso se muestra como aviso limpio,
+        # sin traceback ni mensajes de error técnicos. El modelo recibe el
+        # mensaje completo (sea AVISO: o ERROR:) para poder reaccionar.
+        if success:
+            log_event = EventType.TOOL_RESULT
+            log_prefix = "OK"
+        else:
+            log_event = EventType.INFO
+            log_prefix = "AVISO"
+
+        self._log(
+            task_id,
+            log_event,
+            f"[{tool.name}] {log_prefix}\n{output}",
+        )
+        return ToolResult(call.id, call.name, success, output)
+
+    # --- Estimación de uso de contexto ---
+
+    @staticmethod
+    def _estimate_context_usage(
+        messages: List[Dict[str, Any]],
+    ) -> Tuple[int, int, int]:
+        """
+        Estima el uso de contexto en tokens a partir de los mensajes.
+
+        Aproximación: 1 token ≈ 4 caracteres (estimación conservadora
+        para modelos BPE como LLaMA / Qwen). Se cuentan los caracteres
+        de ``content`` y de los argumentos serializados de ``tool_calls``.
+
+        Devuelve ``(tokens_estimados, max_tokens, porcentaje)``.
+        El porcentaje se limita a ``[0, 100]``.
+        """
+        total_chars = 0
+        for msg in messages:
+            content = msg.get("content") or ""
+            if isinstance(content, str):
+                total_chars += len(content)
+            # Contar también los argumentos de tool_calls.
+            for tc in msg.get("tool_calls", []) or []:
+                if isinstance(tc, dict):
+                    fn = tc.get("function", {})
+                    if isinstance(fn, dict):
+                        args = fn.get("arguments", "")
+                        if isinstance(args, str):
+                            total_chars += len(args)
+                        name = fn.get("name", "")
+                        if isinstance(name, str):
+                            total_chars += len(name)
+        estimated_tokens = total_chars // 4
+        max_tokens = max(1, LLM_N_CTX)
+        percent = min(100, int(estimated_tokens * 100 / max_tokens))
+        return estimated_tokens, LLM_N_CTX, percent
+
+    def _publish_context_usage(
+        self,
+        task_id: int,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        """Publica el uso de contexto estimado en la cola de la UI."""
+        tokens_used, max_tokens, percent = self._estimate_context_usage(messages)
+        self.ui_queue.put(
+            {
+                "type": "context_usage",
+                "task_id": task_id,
+                "tokens_used": tokens_used,
+                "max_tokens": max_tokens,
+                "percent": percent,
+            }
+        )
+
+    # --- Bucle principal ---
+
+    def run(self, task: Task) -> None:
+        """Ejecuta el bucle de razonamiento para una tarea."""
+        if task.id is None:
+            return
+
+        task_id = task.id
+        self._set_status(task_id, TaskStatus.IN_PROGRESS)
+        self._log(
+            task_id,
+            EventType.INFO,
+            f"Tarea creada. Prompt: {task.prompt}",
+        )
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": task.prompt},
+        ]
+
+        final_answer: Optional[str] = None
+        # Contador de iteraciones sin tool_calls para detectar modelos que ignoran tools.
+        no_tool_streak = 0
+        # Flag: indica si el modelo ya usó herramientas en esta tarea.
+        # Una vez que las usa, las respuestas sin tools se aceptan como finales.
+        tools_were_used = False
+        # Detector de bucles: si el modelo repite la misma respuesta
+        # LOOP_THRESHOLD veces, se compacta el contexto.
+        loop_detector = LoopDetector(LOOP_THRESHOLD)
+        try:
+            for iteration in range(1, MAX_ITERATIONS + 1):
+                self._log(
+                    task_id,
+                    EventType.INFO,
+                    f"--- Iteración {iteration}/{MAX_ITERATIONS} ---",
+                )
+
+                # Forzar uso de herramientas solo si el modelo aún no las ha usado.
+                tool_choice = "required" if no_tool_streak >= 1 else "auto"
+
+                try:
+                    raw = self.llm.chat(
+                        messages,
+                        tools=self.tools.to_openai_tools(),
+                        tool_choice=tool_choice,
+                    )
+                except LLMError as e:
+                    self._log(task_id, EventType.ERROR, f"Error LLM: {e}")
+                    self._set_status(task_id, TaskStatus.FAILED)
+                    return
+
+                content, tool_calls = LLMConnector.parse_assistant_message(raw)
+
+                # Detección de bucles: si la misma respuesta (contenido +
+                # tool_calls) se repite LOOP_THRESHOLD veces, se compacta
+                # el contexto para permitir al modelo replantear su estrategia.
+                repeat_count = loop_detector.record(content, tool_calls)
+                if repeat_count >= LOOP_THRESHOLD:
+                    messages = self._compact_context(task_id, messages)
+                    loop_detector.reset()
+                    # Tras compactar, reiniciamos también el contador de
+                    # "no tool_calls" para dar margen al modelo a responder
+                    # de nuevo con herramientas.
+                    no_tool_streak = 0
+                    # Publicar uso de contexto tras la compactación.
+                    self._publish_context_usage(task_id, messages)
+                    continue
+
+                if content:
+                    self._log(task_id, EventType.THOUGHT, content)
+
+                # Si hay tool_calls, ejecutarlos.
+                if tool_calls:
+                    tools_were_used = True
+                    no_tool_streak = 0
+                else:
+                    # Sin tool_calls: si ya se usaron herramientas antes, es respuesta final.
+                    # Si nunca se usaron, inyectar recordatorio para forzar su uso.
+                    if tools_were_used:
+                        final_answer = content or "(sin contenido)"
+                        self._log(task_id, EventType.FINAL_ANSWER, final_answer)
+                        self._set_status(
+                            task_id,
+                            TaskStatus.COMPLETED,
+                            final_answer=final_answer,
+                        )
+                        return
+                    no_tool_streak += 1
+                    if no_tool_streak >= 3:
+                        # Tras 3 intentos sin tools, aceptar como final.
+                        final_answer = content or "(sin contenido)"
+                        self._log(task_id, EventType.FINAL_ANSWER, final_answer)
+                        self._set_status(
+                            task_id,
+                            TaskStatus.COMPLETED,
+                            final_answer=final_answer,
+                        )
+                        return
+                    self._log(
+                        task_id,
+                        EventType.INFO,
+                        "El modelo no usó herramientas. Inyectando recordatorio.",
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "RECORDATORIO OBLIGATORIO: Debes usar las herramientas "
+                                "disponibles (write_file, read_file, execute_command, etc.) "
+                                "para completar la tarea. NO respondas solo con texto. "
+                                "Llama a la herramienta apropiada AHORA con los argumentos "
+                                "correctos en formato JSON."
+                            ),
+                        }
+                    )
+                    continue
+
+                # Registrar tool calls y añadirlos al historial de mensajes.
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": content or None,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                                },
+                            }
+                            for tc in tool_calls
+                        ],
+                    }
+                )
+
+                for tc in tool_calls:
+                    self._log(
+                        task_id,
+                        EventType.TOOL_CALL,
+                        (
+                            f"Llamada a herramienta: {tc.name}\n"
+                            f"Argumentos: {json.dumps(tc.arguments, ensure_ascii=False, indent=2)}"
+                        ),
+                    )
+                    result = self._execute_tool_call(task_id, tc)
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": result.tool_call_id,
+                            "content": result.output,
+                        }
+                    )
+
+                # Publicar uso de contexto tras procesar las herramientas
+                # de esta iteración para que la UI actualice la barra.
+                self._publish_context_usage(task_id, messages)
+
+            # Agotó iteraciones.
+            self._log(
+                task_id,
+                EventType.ERROR,
+                f"Se alcanzó el máximo de iteraciones ({MAX_ITERATIONS}) sin respuesta final.",
+            )
+            self._set_status(task_id, TaskStatus.FAILED)
+
+        except Exception as e:  # noqa: BLE001
+            self._log(
+                task_id,
+                EventType.ERROR,
+                f"Error inesperado en el agente: {e}\n{traceback.format_exc(limit=3)}",
+            )
+            self._set_status(task_id, TaskStatus.FAILED)
+
+
+# ============================================================================
+# INTERFAZ DE USUARIO (Dashboard tkinter)
+# ============================================================================
+
+EVENT_STATUS_COLORS = {
+    TaskStatus.PENDING.value: CONFIG.ui_status_pending,
+    TaskStatus.IN_PROGRESS.value: CONFIG.ui_status_in_progress,
+    TaskStatus.AWAITING_APPROVAL.value: CONFIG.ui_status_awaiting_approval,
+    TaskStatus.COMPLETED.value: CONFIG.ui_status_completed,
+    TaskStatus.FAILED.value: CONFIG.ui_status_failed,
+    TaskStatus.CANCELLED.value: CONFIG.ui_status_cancelled,
+}
+
+EVENT_LABELS = {
+    EventType.THOUGHT.value: "💭 Pensamiento",
+    EventType.TOOL_CALL.value: "🔧 Tool Call",
+    EventType.TOOL_RESULT.value: "📥 Tool Result",
+    EventType.APPROVAL_REQUEST.value: "⚠ Solicitud de aprobación",
+    EventType.APPROVAL_GRANTED.value: "✅ Aprobado",
+    EventType.APPROVAL_DENIED.value: "❌ Denegado",
+    EventType.FINAL_ANSWER.value: "🏁 Respuesta final",
+    EventType.ERROR.value: "⛔ Error",
+    EventType.STATUS_CHANGE.value: "🔄 Estado",
+    EventType.INFO.value: "ℹ Info",
+    EventType.LOOP_DETECTED.value: "🔁 Bucle detectado",
+    EventType.CONTEXT_COMPACTED.value: "🗜 Contexto compactado",
+}
+
+
+def _format_approval_args(tool_name: str, args: Dict[str, Any]) -> str:
+    """
+    Formatea los argumentos de una solicitud de aprobación como texto legible.
+
+    En lugar de mostrar el JSON crudo, presenta cada argumento en una línea
+    con etiqueta clara. Para write_file, muestra también una vista previa del
+    contenido (limitada a 500 caracteres) para que el usuario pueda revisarlo.
+    """
+    if not args:
+        return "(sin argumentos)"
+
+    lines: List[str] = []
+
+    if tool_name == "write_file":
+        path = args.get("path", "")
+        content = args.get("content", "")
+        preview = content if len(content) <= 500 else content[:500] + "\n... [contenido truncado, total: {} caracteres]".format(len(content))
+        lines.append(f"📄 Archivo a escribir: {path}")
+        lines.append(f"📏 Tamaño: {len(content)} caracteres")
+        lines.append("")
+        lines.append("── Vista previa del contenido ──")
+        lines.append(preview)
+    elif tool_name == "execute_command":
+        cmd = args.get("command", "")
+        lines.append(f"💻 Comando a ejecutar:")
+        lines.append(f"   {cmd}")
+    elif tool_name == "delete_file":
+        path = args.get("path", "")
+        lines.append(f"🗑️  Ruta a eliminar: {path}")
+    elif tool_name == "read_file":
+        path = args.get("path", "")
+        lines.append(f"📖 Archivo a leer: {path}")
+    elif tool_name == "list_directory":
+        path = args.get("path", ".")
+        lines.append(f"📁 Directorio a listar: {path}")
+    elif tool_name == "search_files":
+        pattern = args.get("pattern", "")
+        path = args.get("path", ".")
+        lines.append(f"🔍 Patrón de búsqueda: {pattern}")
+        lines.append(f"📁 En directorio: {path}")
+    elif tool_name == "get_current_time":
+        lines.append("🕐 Solicitar fecha/hora actual (sin argumentos)")
+    else:
+        # Herramienta desconocida: mostrar como lista clave-valor.
+        for key, value in args.items():
+            lines.append(f"• {key}: {value}")
+
+    return "\n".join(lines)
+
+
+class Dashboard:
+    """Dashboard interactivo con las 4 zonas de la especificación."""
+
+    POLL_INTERVAL_MS = 200
+
+    def __init__(self, root: Tk) -> None:
+        self.root = root
+        self.root.title("Gestor de Agentes LLM — HITL")
+        self.root.geometry("1280x820")
+        # Tamaño mínimo: ancho suficiente para el tablero en 2 columnas y
+        # alto suficiente para que el prompt (Zona 1) y el panel de
+        # aprobación (Zona 4) queden siempre visibles aunque la ventana
+        # se reduzca verticalmente.
+        self.root.minsize(1000, 560)
+
+        # Aplicar configuración de UI desde config.ini.
+        self._apply_ui_config()
+
+        self.db = Database()
+        # Limpieza de arranque: elimina cualquier tarea que NO haya terminado
+        # (PENDING, IN_PROGRESS, AWAITING_APPROVAL). Esto cubre cierres
+        # bruscos del programa o fallos del agente en sesiones anteriores
+        # que dejaron tareas a medias o esperando aprobación humana.
+        try:
+            unfinished = TaskStatus.unfinished()
+            removed = self.db.delete_tasks_by_status(unfinished)
+            if removed > 0:
+                states = ", ".join(s.value for s in unfinished)
+                print(
+                    f"[init] Se eliminaron {removed} tarea(s) no terminada(s) "
+                    f"en estado {states} al arrancar la aplicación."
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[init] Aviso: no se pudo limpiar el historial de tareas: {exc}")
+        self.tools = ToolsRegistry()
+        self.llm = LLMConnector()
+        self.ui_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        self.permissions = PermissionManager(self.ui_queue)
+        self.agent = Agent(self.db, self.llm, self.tools, self.permissions, self.ui_queue)
+
+        self.selected_task_id: Optional[int] = None
+        self._build_styles()
+        self._build_layout()
+        self._refresh_task_lists()
+        self._poll_queue()
+
+    def _apply_ui_config(self) -> None:
+        """Aplica colores, fuente y modo fullscreen desde la configuración."""
+        try:
+            self.root.configure(bg=CONFIG.ui_bg_color)
+        except Exception:  # noqa: BLE001
+            pass
+        # Fuente base para widgets que no usen estilos ttk.
+        try:
+            default_font = (CONFIG.ui_font_family, CONFIG.ui_font_size)
+            self.root.option_add("*Font", default_font)
+        except Exception:  # noqa: BLE001
+            pass
+        # Fullscreen si está habilitado en config.ini.
+        if CONFIG.ui_fullscreen:
+            try:
+                self.root.state("zoomed")
+            except Exception:  # noqa: BLE001
+                self.root.attributes("-fullscreen", True)
+
+    def _build_config_label_text(self) -> str:
+        """Genera el texto de la barra de estado según el modo LLM."""
+        if LLM_MODE == "local":
+            return (
+                f"LLM: {LLM_MODEL}  ·  Modo: Local (llama-cpp-python, sin endpoint HTTP)  ·  "
+                f"Workspace: {WORKSPACE_DIR}"
+            )
+        return (
+            f"LLM: {LLM_MODEL}  ·  Modo: HTTP  ·  "
+            f"Endpoint: {LLM_BASE_URL}  ·  Workspace: {WORKSPACE_DIR}"
+        )
+
+    # --- Estilos ---
+
+    def _build_styles(self) -> None:
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:  # noqa: BLE001
+            pass
+        # Sin bordes: los objetos se diferencian únicamente por color de fondo.
+        style.configure("TFrame", background=CONFIG.ui_frame_bg, borderwidth=0, relief="flat")
+        style.configure("Card.TFrame", background=CONFIG.ui_card_bg, borderwidth=0, relief="flat")
+        style.configure(
+            "TLabel",
+            background=CONFIG.ui_frame_bg,
+            foreground=CONFIG.ui_fg_color,
+            font=(CONFIG.ui_font_family, CONFIG.ui_font_size),
+        )
+        style.configure(
+            "Card.TLabel",
+            background=CONFIG.ui_card_bg,
+            foreground=CONFIG.ui_fg_color,
+            font=(CONFIG.ui_font_family, CONFIG.ui_font_size),
+        )
+        style.configure(
+            "Title.TLabel",
+            background=CONFIG.ui_frame_bg,
+            foreground=CONFIG.ui_fg_color,
+            font=(CONFIG.ui_font_family, CONFIG.ui_font_size + 2, "bold"),
+        )
+        style.configure(
+            "Header.TLabel",
+            background=CONFIG.ui_card_bg,
+            foreground=CONFIG.ui_fg_color,
+            font=(CONFIG.ui_font_family, CONFIG.ui_font_size + 1, "bold"),
+        )
+        style.configure("Status.PENDING.TLabel", foreground=EVENT_STATUS_COLORS[TaskStatus.PENDING.value])
+        style.configure("Status.IN_PROGRESS.TLabel", foreground=EVENT_STATUS_COLORS[TaskStatus.IN_PROGRESS.value])
+        style.configure("Status.AWAITING_APPROVAL.TLabel", foreground=EVENT_STATUS_COLORS[TaskStatus.AWAITING_APPROVAL.value])
+        style.configure("Status.COMPLETED.TLabel", foreground=EVENT_STATUS_COLORS[TaskStatus.COMPLETED.value])
+        style.configure("Status.FAILED.TLabel", foreground=EVENT_STATUS_COLORS[TaskStatus.FAILED.value])
+        style.configure("Status.CANCELLED.TLabel", foreground=EVENT_STATUS_COLORS[TaskStatus.CANCELLED.value])
+        style.configure(
+            "Execute.TButton",
+            font=(CONFIG.ui_font_family, CONFIG.ui_font_size, "bold"),
+            borderwidth=0,
+        )
+        style.configure(
+            "Allow.TButton",
+            font=(CONFIG.ui_font_family, CONFIG.ui_font_size, "bold"),
+            borderwidth=0,
+        )
+        style.configure(
+            "Deny.TButton",
+            font=(CONFIG.ui_font_family, CONFIG.ui_font_size, "bold"),
+            borderwidth=0,
+        )
+
+    # --- Layout ---
+
+    def _make_scrollable_frame(self, parent: ttk.Frame) -> ttk.Frame:
+        """
+        Crea un contenedor con scroll vertical (Canvas + Scrollbar + Frame interno).
+
+        Empaqueta el contenedor en `parent` (fill="both", expand=True) y devuelve
+        el Frame interno donde se añadirán los widgets hijos. El contenedor ocupa
+        el espacio disponible en `parent` sin crecer indefinidamente, evitando que
+        desplace otros elementos de la interfaz.
+        """
+        container = ttk.Frame(parent, style="Card.TFrame")
+        container.pack(fill="both", expand=True)
+
+        canvas = Canvas(
+            container,
+            bg=CONFIG.ui_card_bg,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        inner = ttk.Frame(canvas, style="Card.TFrame")
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(window_id, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Scroll con rueda del ratón.
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        return inner
+
+    def _build_layout(self) -> None:
+        # ------------------------------------------------------------------
+        # Distribución vertical del dashboard:
+        #
+        #   ┌──────────────────────────────────────────────┐
+        #   │  Zona 1: Prompt + Ejecutar   (top, fijo)     │  ← SIEMPRE visible
+        #   ├──────────────────────────────────────────────┤
+        #   │                                              │
+        #   │  Zona 2: Tablero 2 columnas  (middle)        │  ← se reduce
+        #   │                                              │
+        #   ├──────────────────────────────────────────────┤
+        #   │  Zona 3: Historial           (bottom)        │  ← se reduce
+        #   ├──────────────────────────────────────────────┤
+        #   │  Zona 4: Permisos (HITL)     (bottom, fijo)  │  ← SIEMPRE visible
+        #   └──────────────────────────────────────────────┘
+        #
+        # Las zonas 1 y 4 se empaquetan primero y último respectivamente,
+        # de modo que si la ventana se reduce verticalmente el espacio
+        # sobrante se recorta de las zonas 2 y 3, manteniendo prompt y
+        # permisos siempre visibles.
+        # ------------------------------------------------------------------
+
+        # Zona 1: Prompt + Ejecutar (superior) — SIEMPRE VISIBLE.
+        top = ttk.Frame(self.root, style="TFrame", padding=10)
+        top.pack(side="top", fill="x")
+
+        ttk.Label(top, text="📝 Nueva instrucción para el agente", style="Title.TLabel").pack(
+            anchor="w"
+        )
+        self.prompt_text = Text(
+            top,
+            height=4,
+            wrap="word",
+            font=(CONFIG.ui_mono_font_family, CONFIG.ui_mono_font_size),
+            relief="flat",
+            borderwidth=0,
+            background=CONFIG.ui_prompt_bg,
+            foreground=CONFIG.ui_prompt_fg,
+            highlightthickness=0,
+        )
+        self.prompt_text.pack(fill="x", pady=(6, 6))
+
+        btn_row = ttk.Frame(top, style="TFrame")
+        btn_row.pack(fill="x")
+        ttk.Button(
+            btn_row,
+            text="▶ Ejecutar",
+            style="Execute.TButton",
+            command=self._on_execute,
+        ).pack(side="left")
+        ttk.Button(
+            btn_row,
+            text="🧹 Limpiar",
+            command=self._on_clear_prompt,
+        ).pack(side="left", padx=(8, 0))
+        self.config_label = ttk.Label(
+            btn_row,
+            text=self._build_config_label_text(),
+            style="TLabel",
+        )
+        self.config_label.pack(side="right")
+
+        # Zona 4: Aviso de aprobación (condicional, parte inferior) — SIEMPRE VISIBLE.
+        # Se empaqueta con side="bottom" antes que las zonas 2 y 3 para que
+        # tenga prioridad y no quede oculto si la ventana se reduce verticalmente.
+        self.approval_frame = ttk.Frame(self.root, style="Card.TFrame", padding=10)
+        self.approval_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+        self._build_approval_panel()
+
+        # Barra de progreso de consumo de tokens — SIEMPRE VISIBLE.
+        # Se empaqueta con side="bottom" DESPUÉS del panel de aprobación, por
+        # lo que tkinter la coloca visualmente ENCIMA de dicho panel. Al estar
+        # fuera del contenedor intermedio (que es el que se reduce al
+        # redimensionar la ventana), nunca queda oculta.
+        self._build_context_bar()
+
+        # Contenedor intermedio que ocupa el espacio restante entre el prompt
+        # (arriba) y la barra de contexto (abajo). Alberga las zonas 2 y 3.
+        middle_container = ttk.Frame(self.root, style="TFrame")
+        middle_container.pack(side="top", fill="both", expand=True)
+        middle_container.pack_propagate(False)
+
+        # Zona 2: Tablero 2 columnas (medio).
+        # Altura fija para que el tablero no crezca al añadir tareas y desplace
+        # los botones de aprobación fuera de la pantalla.
+        middle = ttk.Frame(middle_container, style="TFrame", padding=(10, 0))
+        middle.pack(side="top", fill="x")
+        middle.pack_propagate(False)
+        middle.configure(height=420)
+        middle.columnconfigure(0, weight=1)
+        middle.columnconfigure(1, weight=1)
+        middle.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            middle,
+            text="📋 Tablero de tareas",
+            style="Title.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        # Columna izquierda: pendientes / en ejecución.
+        left = ttk.Frame(middle, style="Card.TFrame", padding=8)
+        left.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+        ttk.Label(
+            left,
+            text="Pendientes y en ejecución",
+            style="Header.TLabel",
+        ).pack(anchor="w")
+        self.left_list_frame = self._make_scrollable_frame(left)
+
+        # Columna derecha: ejecutadas / históricas.
+        right = ttk.Frame(middle, style="Card.TFrame", padding=8)
+        right.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+        ttk.Label(
+            right,
+            text="Ejecutadas / Históricas",
+            style="Header.TLabel",
+        ).pack(anchor="w")
+        self.right_list_frame = self._make_scrollable_frame(right)
+
+        # Zona 3: Historial por tarea (inferior).
+        # Es la zona que se reduce primero cuando la ventana pierde altura,
+        # preservando el prompt y el panel de aprobación.
+        bottom = ttk.Frame(middle_container, style="Card.TFrame", padding=8)
+        bottom.pack(side="top", fill="both", expand=True, padx=10, pady=(8, 4))
+
+        history_header = ttk.Frame(bottom, style="Card.TFrame")
+        history_header.pack(fill="x")
+        self.history_title_var = StringVar(value="Historial de tarea (ninguna seleccionada)")
+        ttk.Label(
+            history_header,
+            textvariable=self.history_title_var,
+            style="Header.TLabel",
+        ).pack(side="left")
+        ttk.Button(
+            history_header,
+            text="🔄 Refrescar",
+            command=self._refresh_task_lists,
+        ).pack(side="right")
+
+        self.history_view = ScrolledText(
+            bottom,
+            height=12,
+            wrap="word",
+            font=(CONFIG.ui_mono_font_family, CONFIG.ui_mono_font_size - 1),
+            state="disabled",
+            background=CONFIG.ui_history_bg,
+            foreground=CONFIG.ui_history_fg,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        # Tags de color para resaltar tipos de evento en el historial.
+        # Solo cambia el color del texto; el fondo se mantiene igual.
+        self.history_view.tag_configure(
+            "final_answer",
+            foreground=CONFIG.ui_final_answer_fg,
+            font=(CONFIG.ui_mono_font_family, CONFIG.ui_mono_font_size, "bold"),
+        )
+        self.history_view.tag_configure(
+            "thought",
+            foreground=CONFIG.ui_thought_fg,
+            font=(CONFIG.ui_mono_font_family, CONFIG.ui_mono_font_size - 1, "italic"),
+        )
+        self.history_view.tag_configure(
+            "info",
+            foreground=CONFIG.ui_info_fg,
+        )
+        self.history_view.tag_configure(
+            "tool_call",
+            foreground=CONFIG.ui_tool_call_fg,
+        )
+        self.history_view.tag_configure(
+            "tool_result",
+            foreground=CONFIG.ui_tool_result_fg,
+        )
+        self.history_view.tag_configure(
+            "approval_request",
+            foreground=CONFIG.ui_approval_request_fg,
+        )
+        self.history_view.tag_configure(
+            "approval_granted",
+            foreground=CONFIG.ui_approval_granted_fg,
+        )
+        self.history_view.tag_configure(
+            "approval_denied",
+            foreground=CONFIG.ui_approval_denied_fg,
+        )
+        self.history_view.tag_configure(
+            "error",
+            foreground=CONFIG.ui_error_fg,
+        )
+        self.history_view.tag_configure(
+            "status_change",
+            foreground=CONFIG.ui_status_change_fg,
+        )
+        self.history_view.tag_configure(
+            "loop_detected",
+            foreground=CONFIG.ui_loop_detected_fg,
+        )
+        self.history_view.tag_configure(
+            "context_compacted",
+            foreground=CONFIG.ui_context_compacted_fg,
+        )
+        self.history_view.pack(fill="both", expand=True, pady=(6, 0))
+
+        # Almacén de uso de contexto por tarea. La barra visual se construye
+        # en _build_context_bar() como un frame independiente en self.root,
+        # empaquetado con side="bottom" justo encima del panel de aprobación,
+        # para que permanezca visible aunque la ventana se reduzca.
+        self._context_usage: Dict[int, Dict[str, int]] = {}
+
+    def _build_context_bar(self) -> None:
+        """Crea la barra de progreso de consumo de tokens como frame propio.
+
+        Se empaqueta en self.root con side="bottom" después del panel de
+        aprobación, de modo que quede visualmente **encima** de dicho panel
+        y nunca quede oculta al redimensionar la ventana (el área que se
+        reduce es el contenedor intermedio con las zonas 2 y 3).
+        """
+        context_frame = ttk.Frame(self.root, style="Card.TFrame", padding=(10, 4))
+        context_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
+
+        ttk.Label(
+            context_frame,
+            text="📊 Contexto:",
+            style="Card.TLabel",
+        ).pack(side="left")
+
+        self.context_canvas = Canvas(
+            context_frame,
+            height=16,
+            bg=CONFIG.ui_context_bar_bg,
+            highlightthickness=1,
+            highlightbackground=CONFIG.ui_fg_color,
+            borderwidth=0,
+        )
+        self.context_canvas.pack(side="left", fill="x", expand=True, padx=(6, 6))
+        self.context_canvas.bind("<Configure>", self._on_context_canvas_configure)
+
+        self.context_label_var = StringVar(value="0% (0/0 tokens)")
+        ttk.Label(
+            context_frame,
+            textvariable=self.context_label_var,
+            style="Card.TLabel",
+        ).pack(side="right")
+
+    def _build_approval_panel(self) -> None:
+        for child in self.approval_frame.winfo_children():
+            child.destroy()
+
+        header = ttk.Frame(self.approval_frame, style="Card.TFrame")
+        header.pack(fill="x")
+        # Encabezado dinámico: muestra el contador de solicitudes pendientes
+        # cuando hay más de una en cola.
+        self.approval_header_var = StringVar(
+            value="⚠ Control de permisos (Human-in-the-Loop)"
+        )
+        ttk.Label(
+            header,
+            textvariable=self.approval_header_var,
+            style="Header.TLabel",
+        ).pack(side="left")
+
+        self.approval_info_var = StringVar(value="Sin solicitudes pendientes.")
+        ttk.Label(
+            self.approval_frame,
+            textvariable=self.approval_info_var,
+            style="Card.TLabel",
+            wraplength=1200,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 6))
+
+        self.approval_args_view = ScrolledText(
+            self.approval_frame,
+            height=4,
+            wrap="word",
+            font=(CONFIG.ui_mono_font_family, CONFIG.ui_mono_font_size - 1),
+            state="disabled",
+            background=CONFIG.ui_approval_bg,
+            foreground=CONFIG.ui_approval_fg,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self.approval_args_view.pack(fill="x", pady=(0, 6))
+
+        btn_row = ttk.Frame(self.approval_frame, style="Card.TFrame")
+        btn_row.pack(fill="x")
+        self.allow_btn = ttk.Button(
+            btn_row,
+            text="✅ Permitir",
+            style="Allow.TButton",
+            command=lambda: self._resolve_approval(True),
+            state="disabled",
+        )
+        self.allow_btn.pack(side="left")
+        self.deny_btn = ttk.Button(
+            btn_row,
+            text="❌ Cancelar",
+            style="Deny.TButton",
+            command=lambda: self._resolve_approval(False),
+            state="disabled",
+        )
+        self.deny_btn.pack(side="left", padx=(8, 0))
+
+        # Cola FIFO de solicitudes de aprobación pendientes. Permite que
+        # múltiples tareas en estado AWAITING_APPROVAL coexistan sin que
+        # una solicitud sobrescriba a otra en la UI.
+        self._approval_queue: "collections.deque[Dict[str, Any]]" = collections.deque()
+        self._update_approval_header()
+
+    # --- Acciones de la Zona 1 ---
+
+    def _on_clear_prompt(self) -> None:
+        self.prompt_text.delete("1.0", "end")
+
+    def _on_execute(self) -> None:
+        prompt = self.prompt_text.get("1.0", "end").strip()
+        if not prompt:
+            return
+        title = prompt.splitlines()[0][:80]
+        task = self.db.create_task(title=title, prompt=prompt)
+        self._on_clear_prompt()
+        self._refresh_task_lists()
+        self._select_task(task.id)
+        # Lanza el agente en hilo separado.
+        threading.Thread(
+            target=self.agent.run,
+            args=(task,),
+            daemon=True,
+            name=f"agent-task-{task.id}",
+        ).start()
+
+    # --- Tablero de tareas ---
+
+    def _refresh_task_lists(self) -> None:
+        # Limpia columnas.
+        for frame in (self.left_list_frame, self.right_list_frame):
+            for child in frame.winfo_children():
+                child.destroy()
+
+        active = self.db.list_tasks(
+            [
+                TaskStatus.PENDING,
+                TaskStatus.IN_PROGRESS,
+                TaskStatus.AWAITING_APPROVAL,
+            ]
+        )
+        finished = self.db.list_tasks(
+            [
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            ]
+        )
+
+        if not active:
+            ttk.Label(
+                self.left_list_frame,
+                text="(sin tareas activas)",
+                style="Card.TLabel",
+            ).pack(anchor="w", pady=4)
+        else:
+            for t in active:
+                self._render_task_row(self.left_list_frame, t)
+
+        if not finished:
+            ttk.Label(
+                self.right_list_frame,
+                text="(sin tareas finalizadas)",
+                style="Card.TLabel",
+            ).pack(anchor="w", pady=4)
+        else:
+            for t in finished:
+                self._render_task_row(self.right_list_frame, t)
+
+        # Si la tarea seleccionada ya no existe, limpia el historial.
+        if self.selected_task_id is not None:
+            current = self.db.get_task(self.selected_task_id)
+            if current is None:
+                self._select_task(None)
+
+    def _render_task_row(self, parent: ttk.Frame, task: Task) -> None:
+        row = ttk.Frame(parent, style="Card.TFrame", padding=4)
+        row.pack(fill="x", pady=2)
+
+        status_style = f"Status.{task.status.value}.TLabel"
+        ttk.Label(
+            row,
+            text=f"#{task.id}",
+            style="Card.TLabel",
+            width=4,
+        ).pack(side="left")
+        ttk.Label(
+            row,
+            text=task.status.value,
+            style=status_style,
+            width=18,
+        ).pack(side="left")
+        title_lbl = ttk.Label(
+            row,
+            text=task.title,
+            style="Card.TLabel",
+        )
+        title_lbl.pack(side="left", padx=(6, 6))
+        # Botón seleccionar.
+        btn = ttk.Button(
+            row,
+            text="Ver",
+            command=lambda tid=task.id: self._select_task(tid),
+        )
+        btn.pack(side="right")
+
+    @staticmethod
+    def _tag_for_event(event_type: EventType) -> Optional[str]:
+        """
+        Devuelve el nombre del tag de color para un tipo de evento, o None
+        si el evento no debe resaltarse.
+        """
+        mapping = {
+            EventType.FINAL_ANSWER: "final_answer",
+            EventType.THOUGHT: "thought",
+            EventType.INFO: "info",
+            EventType.TOOL_CALL: "tool_call",
+            EventType.TOOL_RESULT: "tool_result",
+            EventType.APPROVAL_REQUEST: "approval_request",
+            EventType.APPROVAL_GRANTED: "approval_granted",
+            EventType.APPROVAL_DENIED: "approval_denied",
+            EventType.ERROR: "error",
+            EventType.STATUS_CHANGE: "status_change",
+            EventType.LOOP_DETECTED: "loop_detected",
+            EventType.CONTEXT_COMPACTED: "context_compacted",
+        }
+        return mapping.get(event_type)
+
+    def _select_task(self, task_id: Optional[int]) -> None:
+        self.selected_task_id = task_id
+        self.history_view.configure(state="normal")
+        self.history_view.delete("1.0", "end")
+        if task_id is None:
+            self.history_title_var.set("Historial de tarea (ninguna seleccionada)")
+            self.history_view.configure(state="disabled")
+            return
+        task = self.db.get_task(task_id)
+        if task is None:
+            self.history_title_var.set(f"Tarea #{task_id} (no encontrada)")
+            self.history_view.configure(state="disabled")
+            return
+        self.history_title_var.set(
+            f"Historial de tarea #{task.id} — {task.title}  [{task.status.value}]"
+        )
+        entries = self.db.get_history(task_id)
+        for e in entries:
+            label = EVENT_LABELS.get(e.event_type.value, e.event_type.value)
+            header = f"[{e.timestamp}] {label}\n"
+            body = f"{e.content}\n{'-' * 60}\n"
+            tag = self._tag_for_event(e.event_type)
+            if tag:
+                # Cabecera y cuerpo resaltados con el mismo tag.
+                self.history_view.insert("end", header, (tag,))
+                self.history_view.insert("end", body, (tag,))
+            else:
+                self.history_view.insert("end", header + body)
+        self.history_view.see("end")
+        self.history_view.configure(state="disabled")
+        # Actualizar la barra de contexto para la tarea seleccionada.
+        self._refresh_context_bar()
+
+    # --- Barra de uso de contexto ---
+
+    def _on_context_canvas_configure(self, _event: Any) -> None:
+        """Redibuja la barra cuando cambia su tamaño."""
+        self._redraw_context_bar()
+
+    def _redraw_context_bar(self) -> None:
+        """Redibuja la barra de contexto con el valor de la tarea seleccionada."""
+        self.context_canvas.delete("all")
+        width = self.context_canvas.winfo_width()
+        if width <= 1:
+            return
+        height = self.context_canvas.winfo_height() or 16
+
+        percent = 0
+        if self.selected_task_id is not None:
+            usage = self._context_usage.get(self.selected_task_id, {})
+            percent = max(0, min(100, int(usage.get("percent", 0))))
+
+        fill_width = int(width * percent / 100)
+
+        # Color según el nivel de uso.
+        if percent < 60:
+            color = CONFIG.ui_context_bar_low
+        elif percent < 85:
+            color = CONFIG.ui_context_bar_medium
+        else:
+            color = CONFIG.ui_context_bar_high
+
+        if fill_width > 0:
+            self.context_canvas.create_rectangle(
+                0, 0, fill_width, height,
+                fill=color, outline="",
+            )
+
+    def _refresh_context_bar(self) -> None:
+        """Actualiza la etiqueta y la barra para la tarea seleccionada."""
+        if self.selected_task_id is None:
+            self.context_label_var.set("0% (0/0 tokens)")
+            self._redraw_context_bar()
+            return
+        usage = self._context_usage.get(self.selected_task_id)
+        if usage is None:
+            self.context_label_var.set("0% (0/0 tokens)")
+        else:
+            tokens_used = usage.get("tokens_used", 0)
+            max_tokens = usage.get("max_tokens", 0)
+            percent = usage.get("percent", 0)
+            self.context_label_var.set(
+                f"{percent}% ({tokens_used}/{max_tokens} tokens)"
+            )
+        self._redraw_context_bar()
+
+    def _update_context_bar(self, event: Dict[str, Any]) -> None:
+        """Almacena el uso de contexto y actualiza la barra si aplica."""
+        task_id = event.get("task_id")
+        if task_id is None:
+            return
+        self._context_usage[task_id] = {
+            "tokens_used": int(event.get("tokens_used", 0)),
+            "max_tokens": int(event.get("max_tokens", 0)),
+            "percent": int(event.get("percent", 0)),
+        }
+        if task_id == self.selected_task_id:
+            self._refresh_context_bar()
+
+    # --- Zona 4: aprobación ---
+
+    def _resolve_approval(self, granted: bool) -> None:
+        if not self._approval_queue:
+            return
+        # Extrae la primera solicitud de la cola (FIFO) y la resuelve.
+        current = self._approval_queue.popleft()
+        request_id = current["request_id"]
+        task_id = current["task_id"]
+        tool_name = current["tool_name"]
+        self.permissions.resolve(
+            request_id,
+            granted,
+            reason="permitido por el usuario" if granted else "cancelado por el usuario",
+        )
+        # Muestra feedback inmediato de la decisión sobre la solicitud resuelta.
+        if granted:
+            # Aprobado: fondo verde muy claro, texto negro.
+            self.approval_info_var.set(
+                f"✅ Aprobado: herramienta '{tool_name}' permitida."
+            )
+            bg, fg = CONFIG.ui_approval_granted_bg, CONFIG.ui_approval_granted_fg
+        else:
+            # Denegado: fondo rojo claro, texto negro.
+            self.approval_info_var.set(
+                f"❌ Denegado: herramienta '{tool_name}' cancelada."
+            )
+            bg, fg = CONFIG.ui_approval_denied_bg, CONFIG.ui_approval_denied_fg
+        self.approval_args_view.configure(background=bg, foreground=fg)
+        self.approval_args_view.configure(state="normal")
+        self.approval_args_view.delete("1.0", "end")
+        self.approval_args_view.configure(state="disabled")
+        # Refresca tablero e historial.
+        self._refresh_task_lists()
+        if task_id == self.selected_task_id:
+            self._select_task(task_id)
+        # Si quedan solicitudes pendientes en la cola, muestra la siguiente
+        # automáticamente; si no, deshabilita los botones y actualiza el
+        # encabezado.
+        if self._approval_queue:
+            self._render_current_approval()
+        else:
+            self.allow_btn.configure(state="disabled")
+            self.deny_btn.configure(state="disabled")
+            self._update_approval_header()
+
+    # --- Polling de la cola UI -> agente ---
+
+    def _poll_queue(self) -> None:
+        try:
+            while True:
+                event = self.ui_queue.get_nowait()
+                self._handle_event(event)
+        except queue.Empty:
+            pass
+        self.root.after(self.POLL_INTERVAL_MS, self._poll_queue)
+
+    def _handle_event(self, event: Dict[str, Any]) -> None:
+        etype = event.get("type")
+        if etype == "status_change":
+            self._refresh_task_lists()
+            if event.get("task_id") == self.selected_task_id:
+                self._select_task(self.selected_task_id)
+        elif etype == "history_update":
+            if event.get("task_id") == self.selected_task_id:
+                self._select_task(self.selected_task_id)
+        elif etype == "context_usage":
+            self._update_context_bar(event)
+        elif etype == "approval_request":
+            self._show_approval(event)
+
+    def _show_approval(self, event: Dict[str, Any]) -> None:
+        """
+        Encola una nueva solicitud de aprobación y muestra la primera pendiente.
+
+        Si ya hay una solicitud visible, la nueva queda encolada y se mostrará
+        automáticamente cuando el usuario resuelva la actual. Esto evita que
+        una segunda solicitud sobrescriba a la primera y la deje invisible
+        en el panel (el hilo del agente correspondiente quedaría esperando
+        hasta el timeout de 10 minutos).
+        """
+        self._approval_queue.append(event)
+        # Notificación visual siempre que llegue una nueva solicitud.
+        try:
+            self.root.bell()
+        except Exception:  # noqa: BLE001
+            pass
+        # Si ya había una solicitud visible, la nueva queda encolada.
+        if len(self._approval_queue) > 1:
+            self._update_approval_header()
+            return
+        self._render_current_approval()
+
+    def _render_current_approval(self) -> None:
+        """Renderiza en el panel la primera solicitud pendiente de la cola."""
+        if not self._approval_queue:
+            self.approval_info_var.set("Sin solicitudes pendientes.")
+            self.approval_args_view.configure(state="normal")
+            self.approval_args_view.delete("1.0", "end")
+            self.approval_args_view.configure(state="disabled")
+            self.allow_btn.configure(state="disabled")
+            self.deny_btn.configure(state="disabled")
+            self._update_approval_header()
+            return
+        event = self._approval_queue[0]
+        args = event.get("arguments", {}) or {}
+        args_str = _format_approval_args(event.get("tool_name", ""), args)
+        info = (
+            f"Tarea #{event['task_id']}  ·  Herramienta: {event['tool_name']}  "
+            f"·  Riesgo: {event['risk']}\n"
+            f"Descripción: {event.get('tool_description', '')}"
+        )
+        self.approval_info_var.set(info)
+        # Solicitud pendiente: fondo gris claro, texto negro.
+        self.approval_args_view.configure(
+            background=CONFIG.ui_approval_request_bg,
+            foreground=CONFIG.ui_approval_request_fg,
+        )
+        self.approval_args_view.configure(state="normal")
+        self.approval_args_view.delete("1.0", "end")
+        self.approval_args_view.insert("end", args_str)
+        self.approval_args_view.configure(state="disabled")
+        self.allow_btn.configure(state="normal")
+        self.deny_btn.configure(state="normal")
+        self._update_approval_header()
+
+    def _update_approval_header(self) -> None:
+        """Actualiza el encabezado del panel con el contador de pendientes."""
+        pending = len(self._approval_queue)
+        if pending == 0:
+            self.approval_header_var.set(
+                "⚠ Control de permisos (Human-in-the-Loop)"
+            )
+        elif pending == 1:
+            self.approval_header_var.set(
+                "⚠ Control de permisos (Human-in-the-Loop) — 1 solicitud pendiente"
+            )
+        else:
+            self.approval_header_var.set(
+                f"⚠ Control de permisos (Human-in-the-Loop) — {pending} solicitudes pendientes"
+            )
+
+
+# ============================================================================
+# PUNTO DE ENTRADA
+# ============================================================================
+
+def main() -> None:
+    root = Tk()
+    Dashboard(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
