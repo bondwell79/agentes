@@ -132,6 +132,13 @@ def teardown_test_env(tmp_dir: str) -> None:
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def make_test_db(tmp_dir: str) -> ga.Database:
+    """Crea una instancia de Database con una BD temporal única por test."""
+    import time as _time
+    db_path = str(Path(tmp_dir) / f"test_{_time.time_ns()}.db")
+    return ga.Database(db_path=db_path)
+
+
 # ============================================================================
 # MOCKS
 # ============================================================================
@@ -524,7 +531,7 @@ def test_extract_tool_calls_from_text() -> None:
 def test_execute_tool_call(tmp_dir: str, workspace: str) -> None:
     RESULTS.section("_execute_tool_call — ejecución de herramientas")
 
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
     tools = ga.ToolsRegistry()
     permissions = MockPermissionManager(grant=True)
@@ -680,7 +687,7 @@ def test_agent_run_with_bad_responses(tmp_dir: str, workspace: str) -> None:
     RESULTS.section("Agent.run — bucle con respuestas incorrectas del modelo")
 
     # Escenario 1: modelo devuelve tool_call con nombre inexistente.
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
     tools = ga.ToolsRegistry()
     permissions = MockPermissionManager(grant=True)
@@ -731,7 +738,7 @@ def test_agent_run_with_bad_responses(tmp_dir: str, workspace: str) -> None:
     )
 
     # Escenario 2: modelo devuelve tool_call con arguments NO JSON.
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([
         {
@@ -773,7 +780,7 @@ def test_agent_run_with_bad_responses(tmp_dir: str, workspace: str) -> None:
     assert_eq(final.status, ga.TaskStatus.COMPLETED, "agent: arguments no-JSON -> COMPLETED")
 
     # Escenario 3: modelo devuelve tool_call con arguments como lista.
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([
         {
@@ -815,7 +822,7 @@ def test_agent_run_with_bad_responses(tmp_dir: str, workspace: str) -> None:
     assert_eq(final.status, ga.TaskStatus.COMPLETED, "agent: arguments lista -> COMPLETED")
 
     # Escenario 4: modelo devuelve tool_call con ruta fuera del workspace.
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([
         {
@@ -857,7 +864,7 @@ def test_agent_run_with_bad_responses(tmp_dir: str, workspace: str) -> None:
     assert_eq(final.status, ga.TaskStatus.COMPLETED, "agent: ruta maliciosa -> COMPLETED")
 
     # Escenario 5: modelo nunca usa herramientas (solo texto).
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([
         {"choices": [{"message": {"role": "assistant", "content": "Solo texto.", "tool_calls": []}}]},
@@ -877,7 +884,7 @@ def test_agent_run_with_bad_responses(tmp_dir: str, workspace: str) -> None:
     )
 
     # Escenario 6: modelo devuelve tool_calls en formato texto (Qwen3).
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([
         {
@@ -918,7 +925,7 @@ def test_agent_run_with_bad_responses(tmp_dir: str, workspace: str) -> None:
     )
 
     # Escenario 7: modelo devuelve tool_call con JSON inválido en texto.
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([
         {
@@ -951,7 +958,7 @@ def test_agent_run_with_bad_responses(tmp_dir: str, workspace: str) -> None:
     assert_eq(final.status, ga.TaskStatus.COMPLETED, "agent: JSON inválido en texto -> COMPLETED")
 
     # Escenario 8: modelo devuelve múltiples tool_calls en una sola respuesta.
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([
         {
@@ -1001,7 +1008,7 @@ def test_agent_run_with_bad_responses(tmp_dir: str, workspace: str) -> None:
     assert_eq(final.status, ga.TaskStatus.COMPLETED, "agent: múltiples tool_calls -> COMPLETED")
 
     # Escenario 9: modelo devuelve tool_call CRITICAL y el usuario lo deniega.
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     permissions_deny = MockPermissionManager(grant=False)
     llm = MockLLM([
@@ -1048,7 +1055,7 @@ def test_agent_run_with_bad_responses(tmp_dir: str, workspace: str) -> None:
     )
 
     # Escenario 10: modelo devuelve tool_call con nombre vacío.
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([
         {
@@ -1095,7 +1102,7 @@ def test_agent_run_with_exceptions(tmp_dir: str, workspace: str) -> None:
     RESULTS.section("Agent.run — respuestas que causan excepciones")
 
     # Escenario A: LLM lanza LLMError en cada llamada.
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
     tools = ga.ToolsRegistry()
     permissions = MockPermissionManager(grant=True)
@@ -1117,7 +1124,7 @@ def test_agent_run_with_exceptions(tmp_dir: str, workspace: str) -> None:
     assert_eq(llm.call_count, 1, "agent: LLMError se captura en la primera llamada")
 
     # Escenario B: LLM devuelve respuesta sin 'choices' (estructura rota).
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([{"error": "estructura inválida"}])
     agent = ga.Agent(db, llm, tools, permissions, ui_queue)
@@ -1127,7 +1134,7 @@ def test_agent_run_with_exceptions(tmp_dir: str, workspace: str) -> None:
     assert_eq(final.status, ga.TaskStatus.FAILED, "agent: estructura rota -> FAILED")
 
     # Escenario C: LLM devuelve choices vacío.
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([{"choices": []}])
     agent = ga.Agent(db, llm, tools, permissions, ui_queue)
@@ -1138,7 +1145,7 @@ def test_agent_run_with_exceptions(tmp_dir: str, workspace: str) -> None:
 
     # Escenario D: LLM devuelve choices sin message.
     # Debe marcarse como FAILED (corregido).
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([{"choices": [{}]}])
     agent = ga.Agent(db, llm, tools, permissions, ui_queue)
@@ -1148,7 +1155,7 @@ def test_agent_run_with_exceptions(tmp_dir: str, workspace: str) -> None:
     assert_eq(final.status, ga.TaskStatus.FAILED, "agent: sin message -> FAILED")
 
     # Escenario E: LLM devuelve tool_call completamente malformado.
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue = queue.Queue()
     llm = MockLLM([
         {
@@ -1177,7 +1184,7 @@ def test_agent_run_with_exceptions(tmp_dir: str, workspace: str) -> None:
 def test_agent_run_max_iterations(tmp_dir: str, workspace: str) -> None:
     RESULTS.section("Agent.run — agotamiento de iteraciones")
 
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
     tools = ga.ToolsRegistry()
     permissions = MockPermissionManager(grant=True)
@@ -1221,7 +1228,7 @@ def test_agent_run_max_iterations(tmp_dir: str, workspace: str) -> None:
 def test_tools_extreme_args(tmp_dir: str, workspace: str) -> None:
     RESULTS.section("Herramientas — argumentos extremos")
 
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
     ui_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
     tools = ga.ToolsRegistry()
     permissions = MockPermissionManager(grant=True)

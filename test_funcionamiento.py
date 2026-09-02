@@ -130,6 +130,13 @@ def teardown_test_env(tmp_dir: str) -> None:
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def make_test_db(tmp_dir: str) -> ga.Database:
+    """Crea una instancia de Database con una BD temporal única por test."""
+    import time as _time
+    db_path = str(Path(tmp_dir) / f"test_{_time.time_ns()}.db")
+    return ga.Database(db_path=db_path)
+
+
 # ============================================================================
 # MOCKS
 # ============================================================================
@@ -289,7 +296,7 @@ def test_two_sequential_tasks_run_in_parallel(tmp_dir: str, workspace: str) -> N
     RESULTS.section("Dos tareas simultáneas lanzadas secuencialmente por el usuario")
 
     # --- Preparación: cada tarea tiene su propio Agent/MockLLM ---
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
 
     # Respuestas para tarea 1: tool_call (read_file) + respuesta final.
     responses_1 = [
@@ -529,7 +536,7 @@ def test_two_tasks_with_critical_actions(tmp_dir: str, workspace: str) -> None:
     """
     RESULTS.section("Dos tareas simultáneas con acciones CRITICAL (HITL)")
 
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
 
     # Respuestas para tarea 1: tool_call CRITICAL (write_file) + final.
     responses_1 = [
@@ -660,7 +667,7 @@ def test_three_sequential_tasks(tmp_dir: str, workspace: str) -> None:
     """
     RESULTS.section("Tres tareas lanzadas secuencialmente")
 
-    db = ga.Database()
+    db = make_test_db(tmp_dir)
 
     # 3 tareas, cada una con su propio Agent y respuestas.
     agents_and_responses = []

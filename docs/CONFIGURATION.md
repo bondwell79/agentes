@@ -23,6 +23,7 @@
 | `GESTOR_AGENTES_DB` | `gestor_agentes.db` | BD SQLite |
 | `GESTOR_AGENTES_MAX_ITER` | `50` | Iteraciones máx. |
 | `GESTOR_AGENTES_LOOP_THRESHOLD` | `5` | Umbral de bucle |
+| `GESTOR_AGENTES_MAX_RECTIFICATION_RETRIES` | `3` | Reintentos máx. de rectificación |
 | `GESTOR_AGENTES_FULLSCREEN` | `false` | Pantalla completa |
 | `GESTOR_AGENTES_CONFIG` | `config.ini` | Ruta alternativa |
 

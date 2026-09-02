@@ -9,11 +9,12 @@
 ## ✨ Características
 
 - 🤖 **Agente ReAct** con bucle de razonamiento y herramientas.
+- 🎼 **Descomposición automática en subtareas:** cada tarea se divide en Requisitos → Desarrollo → Ejecución/Verificación → Rectificación (si falla).
 - 🛡️ **Human-in-the-Loop (HITL):** aprobación manual de acciones críticas.
 - 🔌 **Modo dual LLM:** local (GGUF con `llama-cpp-python`) o HTTP (OpenAI/Ollama/llama.cpp server).
 - 📊 **Dashboard tkinter** con 4 zonas: prompt, tablero de tareas, historial y panel de aprobación.
 - 💾 **Persistencia SQLite** con borrado en cascada y limpieza al arrancar.
-- 🧪 **Resiliencia probada:** 40+ tests que cubren respuestas malformadas del modelo.
+- 🧪 **Resiliencia probada:** 170+ tests que cubren respuestas malformadas, tareas en paralelo y orquestación de subtareas.
 - 📦 **Ejecutable autónomo** compilable con Nuitka (cero instalación en el destino).
 
 ## 📸 Captura de pantalla
@@ -39,8 +40,9 @@ python gestor_agentes.py
 ## 🧪 Tests
 
 ```bash
-python test_resilience.py        # 40+ escenarios de resiliencia
+python test_resilience.py        # 108+ escenarios de resiliencia
 python test_funcionamiento.py    # tareas en paralelo
+python test_subtareas.py         # orquestador de subtareas
 ```
 
 ## 🏗️ Compilar ejecutable

@@ -39,6 +39,10 @@ Ver [CONFIGURATION.md](CONFIGURATION.md) para la referencia completa.
 2. Pulsa `▶ Ejecutar`.
 3. La tarea aparece en la columna izquierda del tablero.
 
+> **Nuevo:** Cada tarea se descompone automáticamente en 4 subtareas:
+> 📋 Requisitos → 🛠 Desarrollo → ✅ Ejecución/Verificación → 🔧 Rectificación (si falla).
+> Las subtareas se muestran anidadas bajo la tarea padre en el tablero.
+
 ### 4.2. Monitorizar una tarea
 
 - Selecciona una tarea en el tablero para ver su historial en tiempo real.
@@ -49,6 +53,8 @@ Ver [CONFIGURATION.md](CONFIGURATION.md) para la referencia completa.
   - ⚠ Solicitud de aprobación
   - ✅ Aprobado / ❌ Denegado
   - 🏁 Respuesta final
+  - 🎼 Decisión de orquestación
+  - ➕ Subtarea creada / ▶ iniciada / ✔ completada / ✘ fallida
 
 ### 4.3. Aprobar o denegar acciones críticas
 
