@@ -17,10 +17,6 @@
 - 🧪 **Resiliencia probada:** 170+ tests que cubren respuestas malformadas, tareas en paralelo y orquestación de subtareas.
 - 📦 **Ejecutable autónomo** compilable con Nuitka (cero instalación en el destino).
 
-## 📸 Captura de pantalla
-
-*(añadir aquí una captura del dashboard)*
-
 ## 📦 Requisitos
 
 - Python 3.10 o superior
