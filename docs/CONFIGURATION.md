@@ -21,7 +21,7 @@
 | `LLM_N_GPU_LAYERS` | `0` | Capas GPU |
 | `GESTOR_AGENTES_WORKSPACE` | `./workspace` | Workspace |
 | `GESTOR_AGENTES_DB` | `gestor_agentes.db` | BD SQLite |
-| `GESTOR_AGENTES_MAX_ITER` | `10` | Iteraciones máx. |
+| `GESTOR_AGENTES_MAX_ITER` | `50` | Iteraciones máx. |
 | `GESTOR_AGENTES_LOOP_THRESHOLD` | `5` | Umbral de bucle |
 | `GESTOR_AGENTES_FULLSCREEN` | `false` | Pantalla completa |
 | `GESTOR_AGENTES_CONFIG` | `config.ini` | Ruta alternativa |

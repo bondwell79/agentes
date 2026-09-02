@@ -42,7 +42,7 @@ powershell Compress-Archive -Path * -DestinationPath ../gestor_agentes_v1.0.zip
 
 ## 4. Despliegue del modelo GGUF
 
-1. Descarga un modelo compatible (recomendado: Qwen3-4B-Instruct Q4_K_M).
+1. Descarga un modelo compatible (recomendado: `Qwen3-4B-Instruct-2507-Q4_K_M.gguf`).
 2. Colócalo en `modelos/` junto al ejecutable.
 3. Ajusta `config.ini` → `[LLM] model_path`.
 
@@ -64,8 +64,8 @@ ollama serve
 Recomendaciones:
 
 - `fullscreen = false` para entornos con múltiples monitores.
-- `max_iterations = 30` para evitar bucles largos.
-- `loop_threshold = 3` para detectar ciclos antes.
+- `max_iterations = 50` (alineado con el valor por defecto de `config.ini`) para evitar bucles largos.
+- `loop_threshold = 5` (alineado con el valor por defecto de `config.ini`) para detectar ciclos antes.
 - Montar `workspace/` en una carpeta con cuotas si se expone a varios usuarios.
 
 ## 7. Logs y diagnóstico

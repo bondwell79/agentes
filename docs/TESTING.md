@@ -30,4 +30,4 @@ python test_funcionamiento.py
 1. Crea una clase mock que herede de `LLMConnector`.
 2. Define las respuestas que quieres simular.
 3. Llama a `Agent.run()` y verifica el estado final.
-4. Usa `assert_eq` / `assert_true` del módulo de utilidades.
+4. Usa los helpers `assert_eq`, `assert_true`, `assert_raises` y `assert_not_crashes` definidos al inicio de cada fichero de test (no requieren import externo).

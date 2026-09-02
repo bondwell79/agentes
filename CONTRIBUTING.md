@@ -2,7 +2,7 @@
 
 ## Reportar bugs
 
-Abre un [issue](https://github.com/<usuario>/gestor-agentes/issues) con:
+Abre un [issue](https://github.com/ruben-pastor/gestor-agentes/issues) con:
 - Pasos para reproducir.
 - Salida esperada vs. obtenida.
 - Versión de Python y SO.
@@ -29,3 +29,7 @@ python test_funcionamiento.py
 ```
 
 Ambos deben pasar al 100%. Añade tests para cualquier bug que corrijas.
+
+## Contacto
+
+**Rubén Pastor** — `bondwell_@hotmail.com`

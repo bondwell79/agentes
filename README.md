@@ -25,12 +25,12 @@
 - Python 3.10 o superior
 - Windows 10/11 (probado en Windows; tkinter es multiplataforma)
 - Opcional: `llama-cpp-python` (solo para modo local)
-- Opcional: un modelo GGUF (recomendado: Qwen3-4B-Instruct)
+- Opcional: un modelo GGUF (recomendado: `Qwen3-4B-Instruct-2507-Q4_K_M.gguf`)
 
 ## 🚀 Instalación rápida
 
 ```bash
-git clone https://github.com/<usuario>/gestor-agentes.git
+git clone https://github.com/ruben-pastor/gestor-agentes.git
 cd gestor-agentes
 copy config.ini.example config.ini
 python gestor_agentes.py
@@ -63,3 +63,7 @@ El ejecutable queda en `gestor_agentes.dist/gestor_agentes.exe`.
 ## 📄 Licencia
 
 MIT — ver [LICENSE](LICENSE).
+
+## 👤 Autor
+
+**Rubén Pastor** — `bondwell_@hotmail.com`

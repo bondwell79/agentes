@@ -2,7 +2,11 @@
 
 Todos los cambios notables se documentan aquí. Formato basado en [Keep a Changelog](https://keepachangelog.com/).
 
+**Mantenedor:** Rubén Pastor — `bondwell_@hotmail.com`
+
 ## [Unreleased]
+
+## [1.0.0] - 2026-09-02
 
 ### Added
 - Suite de tests de resiliencia con 40+ escenarios.

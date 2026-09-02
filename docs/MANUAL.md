@@ -84,6 +84,6 @@ Puedes lanzar varias tareas seguidas sin esperar a que terminen. Cada una corre 
 
 ## 6. Solución de problemas
 
-- **El agente no usa herramientas:** el sistema aplica automáticamente la regla de 3 strikes; si el modelo es muy pequeño, considera usar uno mayor.
+- **El agente no usa herramientas:** el sistema aplica automáticamente la [regla de 3 strikes](ARCHITECTURE.md#21-mecanismo-de-forzado-de-herramientas-3-strikes); si el modelo es muy pequeño, considera usar uno mayor.
 - **Error "ruta fuera del workspace":** todas las rutas deben ser relativas a la carpeta configurada en `[Workspace] path`.
 - **Comando bloqueado:** la denylist incluye `rm -rf /`, `format`, `shutdown`, etc.
