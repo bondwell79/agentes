@@ -257,6 +257,7 @@ graph TD
 | `GESTOR_AGENTES_WORKSPACE` | `[Workspace]` | Directorio restringido |
 | `GESTOR_AGENTES_DB` | `[Database]` | Ruta del fichero SQLite |
 | `GESTOR_AGENTES_MAX_ITER` | `[Agent]` | Máximo de iteraciones del bucle ReAct |
+| `GESTOR_AGENTES_LOOP_THRESHOLD` | `[Agent]` | Umbral de detección de bucles (repite respuesta N veces → compacta contexto) |
 | `GESTOR_AGENTES_FULLSCREEN` | `[UI]` | Ventana en pantalla completa |
 | `GESTOR_AGENTES_CONFIG` | — | Ruta alternativa al fichero `config.ini` |
 
@@ -302,23 +303,33 @@ El sistema está diseñado para **no romperse** ante respuestas incorrectas del 
 
 ## 9. Compilación y Despliegue
 
-El proyecto incluye scripts para compilar un ejecutable autónomo con **Nuitka**:
+El proyecto se compila con **Nuitka** mediante el script `nuitka.bat`:
 
-- `nuitka.bat` — script de compilación.
-- `gestor_agentes.spec` — especificación de Nuitka.
-- `compilar.bat` — script alternativo de compilación.
-- `gestor_agentes.build/` — artefactos intermedios de compilación.
-- `gestor_agentes.dist/` — ejecutable final distribuible.
+```bash
+python -m nuitka --standalone --windows-console-mode=disable \
+  --include-package=llama_cpp --include-package-data=llama_cpp \
+  --enable-plugin=tk-inter gestor_agentes.py
+```
+
+Artefactos generados:
+
+- `gestor_agentes.build/` — código C intermedio (puede ignorarse tras la compilación).
+- `gestor_agentes.dist/` — distribución final con el ejecutable `gestor_agentes.exe`.
+
+> Nota: el fichero `gestor_agentes.spec` (PyInstaller) está obsoleto y no se utiliza; el método de compilación actual es exclusivamente Nuitka.
 
 ---
 
 ## 10. Ejecución de Tests
 
 ```bash
-python test_resilience.py
+python test_resilience.py        # 40+ escenarios de resiliencia
+python test_funcionamiento.py    # tareas en paralelo
 ```
 
-La suite de tests (`test_resilience.py`) verifica más de 40 escenarios de resiliencia sin necesidad de un LLM real ni de la UI tkinter, utilizando mocks para `LLMConnector` y `PermissionManager`. Cubre:
+### `test_resilience.py`
+
+Verifica más de 40 escenarios de resiliencia sin necesidad de un LLM real ni de la UI tkinter, utilizando mocks para `LLMConnector` y `PermissionManager`. Cubre:
 
 - Parsing de respuestas malformadas.
 - Extracción de tool_calls desde texto.
@@ -327,6 +338,10 @@ La suite de tests (`test_resilience.py`) verifica más de 40 escenarios de resil
 - Bucle del agente con respuestas que causan excepciones.
 - Agotamiento de iteraciones.
 - Herramientas con argumentos extremos (path traversal, contenido grande, tipos incorrectos).
+
+### `test_funcionamiento.py`
+
+Verifica que el sistema acepta múltiples tareas en paralelo y mantiene historiales independientes entre tareas.
 
 ---
 
@@ -341,5 +356,5 @@ La suite de tests (`test_resilience.py`) verifica más de 40 escenarios de resil
 | **HITL** | Timeout de 10 min; argumentos formateados con vista previa; notificación sonora. |
 | **Herramientas** | Nuevas: `get_current_time`, `delete_file`; denylist de comandos; timeout 30s; truncado de salida. |
 | **Persistencia** | Limpieza de tareas PENDING/IN_PROGRESS al arrancar; FK con cascade; índices; thread-safety. |
-| **Resiliencia** | Suite de tests con 40+ escenarios; corrección de bug en `choices[0]` sin `message`. |
+| **Resiliencia** | Suite de tests con 40+ escenarios; corrección de bug en `choices[0]` sin `message`; detección de bucles con `loop_threshold` y compactación automática de contexto. |
 | **Despliegue** | Compilación con Nuitka; ejecutable autónomo. |
