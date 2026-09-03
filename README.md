@@ -27,7 +27,7 @@
 ## 🚀 Instalación rápida
 
 ```bash
-git clone https://github.com/ruben-pastor/gestor-agentes.git
+git clone https://github.com/bondwell79/agentes.git
 cd gestor-agentes
 python gestor_agentes.py
 ```
