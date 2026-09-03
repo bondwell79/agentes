@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from tkinter import Canvas, Tk, StringVar, Text, Toplevel, ttk
+from tkinter import BooleanVar, Canvas, Tk, StringVar, Text, Toplevel, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -96,24 +96,25 @@ class Config:
             "max_iterations": "10",
             "loop_threshold": "5",
             "max_rectification_retries": "3",
+            "context_compact_threshold": "80",
         },
         "UI": {
             "fullscreen": "false",
-            "bg_color": "#f0f0f0",
-            "fg_color": "#1a1a1a",
-            "frame_bg": "#f5f5f5",
-            "card_bg": "#ffffff",
-            "prompt_bg": "#ffffff",
-            "prompt_fg": "#000000",
-            "history_bg": "#ffffff",
-            "history_fg": "#000000",
-            "approval_bg": "#fff4e1",
-            "approval_fg": "#5a3a00",
-            "approval_request_bg": "#ffffff",
-            "approval_request_fg": "#5a3a00",
-            "approval_granted_bg": "#ffffff",
+            "bg_color": "#1e1e1e",
+            "fg_color": "#e0e0e0",
+            "frame_bg": "#252526",
+            "card_bg": "#2d2d30",
+            "prompt_bg": "#1e1e1e",
+            "prompt_fg": "#e0e0e0",
+            "history_bg": "#1e1e1e",
+            "history_fg": "#d4d4d4",
+            "approval_bg": "#1e1e1e",
+            "approval_fg": "#b6eea8",
+            "approval_request_bg": "#1e1e1e",
+            "approval_request_fg": "#a88647",
+            "approval_granted_bg": "#1e1e1e",
             "approval_granted_fg": "#388e3c",
-            "approval_denied_bg": "#ffffff",
+            "approval_denied_bg": "#1e1e1e",
             "approval_denied_fg": "#d32f2f",
             "final_answer_fg": "#4caf50",
             "thought_fg": "#e65100",
@@ -128,11 +129,11 @@ class Config:
             "loop_detected_fg": "#ce93d8",
             "context_compacted_fg": "#ce93d8",
             "status_pending": "#9e9e9e",
-            "status_in_progress": "#1976d2",
-            "status_awaiting_approval": "#f57c00",
-            "status_completed": "#388e3c",
-            "status_failed": "#d32f2f",
-            "status_cancelled": "#616161",
+            "status_in_progress": "#4fc3f7",
+            "status_awaiting_approval": "#ffb74d",
+            "status_completed": "#66bb6a",
+            "status_failed": "#ef5350",
+            "status_cancelled": "#9e9e9e",
             "font_family": "Segoe UI",
             "font_size": "10",
             "mono_font_family": "Consolas",
@@ -141,6 +142,11 @@ class Config:
             "context_bar_low": "#4caf50",
             "context_bar_medium": "#ff9800",
             "context_bar_high": "#f44336",
+            "browser_bg": "#2d2d30",
+            "browser_fg": "#e0e0e0",
+            "browser_header_bg": "#252526",
+            "browser_selected_bg": "#264f78",
+            "browser_selected_fg": "#ffffff",
         },
     }
 
@@ -248,6 +254,24 @@ class Config:
             return int(env_val)
         return self._parser.getint("Agent", "max_rectification_retries")
 
+    @property
+    def context_compact_threshold(self) -> int:
+        """
+        Umbral (en porcentaje, 1-100) del contexto a partir del cual
+        se compacta automáticamente antes de enviar al modelo.
+
+        Si el valor está fuera del rango válido, se limita a [1, 100].
+        """
+        env_val = os.environ.get("GESTOR_AGENTES_CONTEXT_COMPACT_THRESHOLD")
+        if env_val:
+            try:
+                value = int(env_val)
+            except ValueError:
+                value = self._parser.getint("Agent", "context_compact_threshold")
+        else:
+            value = self._parser.getint("Agent", "context_compact_threshold")
+        return max(1, min(100, value))
+
     # --- UI ---
 
     @property
@@ -272,6 +296,26 @@ class Config:
     @property
     def ui_card_bg(self) -> str:
         return self._parser.get("UI", "card_bg")
+
+    @property
+    def ui_browser_bg(self) -> str:
+        return self._parser.get("UI", "browser_bg")
+
+    @property
+    def ui_browser_fg(self) -> str:
+        return self._parser.get("UI", "browser_fg")
+
+    @property
+    def ui_browser_header_bg(self) -> str:
+        return self._parser.get("UI", "browser_header_bg")
+
+    @property
+    def ui_browser_selected_bg(self) -> str:
+        return self._parser.get("UI", "browser_selected_bg")
+
+    @property
+    def ui_browser_selected_fg(self) -> str:
+        return self._parser.get("UI", "browser_selected_fg")
 
     @property
     def ui_prompt_bg(self) -> str:
@@ -434,6 +478,7 @@ DB_PATH = CONFIG.db_path
 MAX_ITERATIONS = CONFIG.max_iterations
 LOOP_THRESHOLD = CONFIG.loop_threshold
 MAX_RECTIFICATION_RETRIES = CONFIG.max_rectification_retries
+CONTEXT_COMPACT_THRESHOLD = CONFIG.context_compact_threshold
 LLM_MODE = CONFIG.llm_mode
 LLM_BASE_URL = CONFIG.llm_base_url
 LLM_API_KEY = CONFIG.llm_api_key
@@ -500,6 +545,9 @@ class EventType(str, Enum):
     SUBTASK_COMPLETED = "subtask_completed"
     SUBTASK_FAILED = "subtask_failed"
     ORCHESTRATION_DECISION = "orchestration_decision"
+    PREAUTHORIZATION_REQUEST = "preauthorization_request"
+    PREAUTHORIZATION_GRANTED = "preauthorization_granted"
+    PREAUTHORIZATION_DENIED = "preauthorization_denied"
 
 
 class SubtaskType(str, Enum):
@@ -2262,6 +2310,29 @@ class Agent:
                     f"--- Iteración {iteration}/{MAX_ITERATIONS} ---",
                 )
 
+                # Compactación preventiva por tamaño de contexto: antes de
+                # enviar el historial al modelo, se estima el uso de tokens.
+                # Si supera el porcentaje configurado (CONTEXT_COMPACT_THRESHOLD)
+                # del límite n_ctx, se compacta el contexto para evitar que
+                # el modelo se quede sin espacio o degrade la respuesta.
+                # Esto es independiente de la detección de bucles.
+                _, _, current_percent = self._estimate_context_usage(messages)
+                if current_percent >= CONTEXT_COMPACT_THRESHOLD and len(messages) > 2:
+                    self._log(
+                        task_id,
+                        EventType.INFO,
+                        (
+                            f"⚠ Contexto al {current_percent}% del límite "
+                            f"(umbral {CONTEXT_COMPACT_THRESHOLD}%). "
+                            f"Compactando preventivamente antes de enviar al modelo."
+                        ),
+                    )
+                    messages = self._compact_context(task_id, messages)
+                    loop_detector.reset()
+                    no_tool_streak = 0
+                    self._publish_context_usage(task_id, messages)
+                    continue
+
                 # Forzar uso de herramientas solo si el modelo aún no las ha usado.
                 tool_choice = "required" if no_tool_streak >= 1 else "auto"
 
@@ -2898,6 +2969,23 @@ def _format_approval_args(tool_name: str, args: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_size(num_bytes: int) -> str:
+    """Formatea un tamaño en bytes como cadena legible (B/KB/MB/GB)."""
+    try:
+        n = int(num_bytes)
+    except (TypeError, ValueError):
+        return "?"
+    if n < 0:
+        return "?"
+    if n < 1024:
+        return f"{n} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024.0
+        if n < 1024.0:
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} PB"
+
+
 class Dashboard:
     """Dashboard interactivo con las 4 zonas de la especificación."""
 
@@ -2992,6 +3080,30 @@ class Dashboard:
         # Sin bordes: los objetos se diferencian únicamente por color de fondo.
         style.configure("TFrame", background=CONFIG.ui_frame_bg, borderwidth=0, relief="flat")
         style.configure("Card.TFrame", background=CONFIG.ui_card_bg, borderwidth=0, relief="flat")
+        # Estilos del explorador de ficheros (Treeview).
+        style.configure(
+            "Treeview",
+            background=CONFIG.ui_browser_bg,
+            foreground=CONFIG.ui_browser_fg,
+            fieldbackground=CONFIG.ui_browser_bg,
+            borderwidth=0,
+            rowheight=22,
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", CONFIG.ui_browser_selected_bg)],
+            foreground=[("selected", CONFIG.ui_browser_selected_fg)],
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=CONFIG.ui_browser_header_bg,
+            foreground=CONFIG.ui_browser_fg,
+            relief="flat",
+        )
+        style.map(
+            "Treeview.Heading",
+            background=[("active", CONFIG.ui_browser_header_bg)],
+        )
         style.configure(
             "TLabel",
             background=CONFIG.ui_frame_bg,
@@ -3204,13 +3316,22 @@ class Dashboard:
         ).pack(anchor="w")
         self.right_list_frame = self._make_scrollable_frame(right)
 
-        # Zona 3: Historial por tarea (inferior).
+        # Zona 3: Historial por tarea (izquierda) + Explorador de ficheros (derecha).
         # Es la zona que se reduce primero cuando la ventana pierde altura,
         # preservando el prompt y el panel de aprobación.
-        bottom = ttk.Frame(middle_container, style="Card.TFrame", padding=8)
-        bottom.pack(side="top", fill="both", expand=True, padx=10, pady=(8, 4))
+        # El ancho se reparte 50/50 entre historial (columna 0) y explorador
+        # (columna 1) mediante columnconfigure(weight=1) en ambos.
+        bottom = ttk.Frame(middle_container, style="TFrame", padding=(10, 8, 10, 4))
+        bottom.pack(side="top", fill="both", expand=True)
+        bottom.columnconfigure(0, weight=1)  # Historial: 50%
+        bottom.columnconfigure(1, weight=1)  # Explorador: 50%
+        bottom.rowconfigure(0, weight=1)
 
-        history_header = ttk.Frame(bottom, style="Card.TFrame")
+        # --- Columna izquierda: Historial de la tarea seleccionada ---
+        history_panel = ttk.Frame(bottom, style="Card.TFrame", padding=8)
+        history_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+
+        history_header = ttk.Frame(history_panel, style="Card.TFrame")
         history_header.pack(fill="x")
         self.history_title_var = StringVar(value="Historial de tarea (ninguna seleccionada)")
         ttk.Label(
@@ -3225,7 +3346,7 @@ class Dashboard:
         ).pack(side="right")
 
         self.history_view = ScrolledText(
-            bottom,
+            history_panel,
             height=12,
             wrap="word",
             font=(CONFIG.ui_mono_font_family, CONFIG.ui_mono_font_size - 1),
@@ -3289,6 +3410,64 @@ class Dashboard:
             foreground=CONFIG.ui_context_compacted_fg,
         )
         self.history_view.pack(fill="both", expand=True, pady=(6, 0))
+
+        # --- Columna derecha: Explorador de ficheros del workspace ---
+        browser_panel = ttk.Frame(bottom, style="Card.TFrame", padding=8)
+        browser_panel.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+
+        browser_header = ttk.Frame(browser_panel, style="Card.TFrame")
+        browser_header.pack(fill="x")
+        self.browser_title_var = StringVar(value=f"📁 Explorador: {WORKSPACE_DIR}")
+        ttk.Label(
+            browser_header,
+            textvariable=self.browser_title_var,
+            style="Header.TLabel",
+        ).pack(side="left")
+        browser_btns = ttk.Frame(browser_header, style="Card.TFrame")
+        browser_btns.pack(side="right")
+        ttk.Button(
+            browser_btns,
+            text="⬆ Padre",
+            command=self._on_browser_up,
+        ).pack(side="left")
+        ttk.Button(
+            browser_btns,
+            text="🔄 Refrescar",
+            command=self._refresh_file_browser,
+        ).pack(side="left", padx=(4, 0))
+
+        # Ruta actual del explorador (relativa al workspace).
+        self._browser_current_dir: Path = WORKSPACE_DIR
+        # Treeview con scrollbar para mostrar el contenido del directorio.
+        browser_body = ttk.Frame(browser_panel, style="Card.TFrame")
+        browser_body.pack(fill="both", expand=True, pady=(6, 0))
+
+        self.browser_tree = ttk.Treeview(
+            browser_body,
+            columns=("size",),
+            show="tree headings",
+            selectmode="browse",
+        )
+        self.browser_tree.heading("#0", text="Nombre")
+        self.browser_tree.heading("size", text="Tamaño")
+        self.browser_tree.column("#0", width=240, stretch=True)
+        self.browser_tree.column("size", width=90, stretch=False, anchor="e")
+
+        browser_scroll = ttk.Scrollbar(
+            browser_body, orient="vertical", command=self.browser_tree.yview
+        )
+        self.browser_tree.configure(yscrollcommand=browser_scroll.set)
+        self.browser_tree.pack(side="left", fill="both", expand=True)
+        browser_scroll.pack(side="right", fill="y")
+
+        # Doble clic: abre carpeta o muestra el contenido del fichero en
+        # una ventana independiente (Toplevel).
+        self.browser_tree.bind("<Double-1>", self._on_browser_activate)
+        # Tecla Enter: mismo efecto que doble clic.
+        self.browser_tree.bind("<Return>", self._on_browser_activate)
+
+        # Carga inicial del explorador.
+        self._refresh_file_browser()
 
         # Almacén de uso de contexto por tarea. La barra visual se construye
         # en _build_context_bar() como un frame independiente en self.root,
@@ -3389,6 +3568,20 @@ class Dashboard:
             state="disabled",
         )
         self.deny_btn.pack(side="left", padx=(8, 0))
+
+        # Casilla "preautorizar": cuando está marcada, las solicitudes de
+        # aprobación se consultan al LLM antes de mostrarse al usuario.
+        # Si el modelo responde afirmativamente, la acción se autoriza
+        # automáticamente; si no, queda pendiente para decisión humana.
+        # El prompt se envía SEPARADO del contexto del agente (no se añade
+        # a la conversación principal ni al historial de la tarea).
+        self.preauth_var = BooleanVar(value=False)
+        ttk.Checkbutton(
+            btn_row,
+            text="🤖 Preautorizar",
+            variable=self.preauth_var,
+            style="Card.TCheckbutton",
+        ).pack(side="right")
 
         # Cola FIFO de solicitudes de aprobación pendientes. Permite que
         # múltiples tareas en estado AWAITING_APPROVAL coexistan sin que
@@ -3723,12 +3916,22 @@ class Dashboard:
         """
         Encola una nueva solicitud de aprobación y muestra la primera pendiente.
 
+        Si la casilla "preautorizar" está marcada, se consulta al LLM en
+        segundo plano antes de mostrar la solicitud al usuario. Si el modelo
+        responde afirmativamente, la acción se autoriza automáticamente; si
+        no, la solicitud queda pendiente para que el usuario la resuelva.
+
         Si ya hay una solicitud visible, la nueva queda encolada y se mostrará
         automáticamente cuando el usuario resuelva la actual. Esto evita que
         una segunda solicitud sobrescriba a la primera y la deje invisible
         en el panel (el hilo del agente correspondiente quedaría esperando
         hasta el timeout de 10 minutos).
         """
+        # Si la casilla "preautorizar" está marcada, se consulta al LLM
+        # en segundo plano antes de mostrar la solicitud al usuario.
+        if self.preauth_var.get():
+            self._start_preauthorization(event)
+            return
         self._approval_queue.append(event)
         # Notificación visual siempre que llegue una nueva solicitud.
         try:
@@ -3740,6 +3943,204 @@ class Dashboard:
             self._update_approval_header()
             return
         self._render_current_approval()
+
+    def _start_preauthorization(self, event: Dict[str, Any]) -> None:
+        """
+        Consulta al LLM en segundo plano para preautorizar una solicitud.
+
+        Muestra feedback inmediato en el panel ("Consultando al modelo...")
+        y lanza un hilo que:
+          - Envía un prompt aislado al LLM (separado del contexto del agente).
+          - Si el modelo responde afirmativamente, resuelve la aprobación
+            automáticamente y registra el evento en el historial.
+          - Si responde negativamente o la respuesta es ambigua, encola
+            la solicitud para que el usuario la resuelva manualmente.
+
+        Si ya hay otra solicitud visible en el panel, el preauth se ejecuta
+        en silencio (sin sobrescribir el panel) y el resultado se aplica
+        cuando termina: o bien se resuelve directamente, o bien se encola
+        para mostrarse cuando el usuario resuelva la solicitud actual.
+        """
+        request_id = event["request_id"]
+        task_id = event["task_id"]
+        tool_name = event["tool_name"]
+
+        # Si ya hay una solicitud visible en el panel, no lo sobrescribimos:
+        # ejecutamos el preauth en silencio y encolamos/resolvedemos al terminar.
+        panel_busy = len(self._approval_queue) > 0
+
+        if not panel_busy:
+            # Feedback inmediato en el panel.
+            self.approval_info_var.set(
+                f"🤖 Consultando al modelo sobre la seguridad de '{tool_name}'..."
+            )
+            self.approval_args_view.configure(
+                background=CONFIG.ui_approval_request_bg,
+                foreground=CONFIG.ui_approval_request_fg,
+            )
+            self.approval_args_view.configure(state="normal")
+            self.approval_args_view.delete("1.0", "end")
+            self.approval_args_view.insert(
+                "end",
+                f"Tarea #{task_id}  ·  Herramienta: {tool_name}\n"
+                f"Esperando respuesta del modelo...",
+            )
+            self.approval_args_view.configure(state="disabled")
+            self.allow_btn.configure(state="disabled")
+            self.deny_btn.configure(state="disabled")
+
+        def _worker() -> None:
+            try:
+                approved, reason = self._query_llm_for_preauth(event)
+            except Exception as exc:  # noqa: BLE001
+                approved, reason = False, f"error en la consulta al LLM: {exc}"
+
+            def _apply_result() -> None:
+                if approved:
+                    # Autorización automática: desbloquea el hilo del agente.
+                    self.permissions.resolve(
+                        request_id,
+                        True,
+                        reason=f"preautorizado por LLM: {reason}",
+                    )
+                    self._log_event(
+                        task_id,
+                        EventType.PREAUTHORIZATION_GRANTED,
+                        (
+                            f"🤖 Preautorizado por LLM: herramienta '{tool_name}'. "
+                            f"Motivo: {reason}"
+                        ),
+                    )
+                    if not panel_busy:
+                        self.approval_info_var.set(
+                            f"🤖 Preautorizado por LLM: '{tool_name}' — {reason}"
+                        )
+                        self.approval_args_view.configure(
+                            background=CONFIG.ui_approval_granted_bg,
+                            foreground=CONFIG.ui_approval_granted_fg,
+                        )
+                        self.approval_args_view.configure(state="normal")
+                        self.approval_args_view.delete("1.0", "end")
+                        self.approval_args_view.configure(state="disabled")
+                    self._refresh_task_lists()
+                    if task_id == self.selected_task_id:
+                        self._select_task(task_id)
+                    self._update_approval_header()
+                else:
+                    # El LLM recomienda no autorizar: encolar para el usuario.
+                    self._log_event(
+                        task_id,
+                        EventType.PREAUTHORIZATION_DENIED,
+                        (
+                            f"🤖 LLM recomienda NO autorizar '{tool_name}'. "
+                            f"Motivo: {reason}. Pendiente de decisión del usuario."
+                        ),
+                    )
+                    self._approval_queue.append(event)
+                    if not panel_busy:
+                        self._render_current_approval()
+                    else:
+                        self._update_approval_header()
+
+            try:
+                self.root.after(0, _apply_result)
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"preauth-{request_id[:8]}",
+        ).start()
+
+    def _query_llm_for_preauth(self, event: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Envía un prompt aislado al LLM para evaluar la seguridad de una acción.
+
+        El prompt está completamente separado del contexto del agente: no
+        se añade a la conversación principal ni afecta al historial de la
+        tarea. El LLM recibe un system prompt que le instruye actuar como
+        auditor de seguridad y responder únicamente con SI/NO + justificación.
+
+        Devuelve (aprobado, motivo). Si la respuesta es ambigua o el LLM
+        no responde, devuelve (False, motivo) por seguridad.
+        """
+        tool_name = event.get("tool_name", "?")
+        tool_desc = event.get("tool_description", "")
+        risk = event.get("risk", "?")
+        args = event.get("arguments", {}) or {}
+        args_str = _format_approval_args(tool_name, args)
+
+        system_msg = (
+            "Eres un auditor de seguridad de un agente autónomo. "
+            "Tu única tarea es evaluar si una acción propuesta es SEGURA "
+            "para los ficheros del usuario y NO expone datos privados. "
+            "Responde ÚNICAMENTE con una línea que comience por 'SI' o 'NO' "
+            "seguida de una justificación breve (máximo 200 caracteres). "
+            "Criterios de evaluación:\n"
+            "- ¿La acción podría borrar, sobrescribir o corromper ficheros del usuario?\n"
+            "- ¿La acción expone datos privados (contraseñas, claves API, datos personales)?\n"
+            "- ¿La acción accede a rutas fuera del workspace permitido?\n"
+            "- ¿La acción ejecuta comandos del sistema potencialmente destructivos?\n"
+            "Si cualquiera de estos riesgos es real, responde NO."
+        )
+        user_msg = (
+            f"Herramienta: {tool_name}\n"
+            f"Descripción: {tool_desc}\n"
+            f"Riesgo declarado: {risk}\n"
+            f"Argumentos:\n{args_str}\n\n"
+            f"¿Es seguro ejecutar esta acción sin intervención humana? "
+            f"Responde SI o NO seguido de una justificación breve."
+        )
+
+        response = self.llm.chat(
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ]
+        )
+        content = (
+            response.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+
+        # Parsear respuesta: buscar SI/NO al inicio (tolerando signos de
+        # interrogación/exclamación y espacios).
+        upper = content.upper().lstrip("¿?!.,;: \t")
+        affirmative_prefixes = ("SI", "SÍ", "YES", "APROBAR", "SEGURO", "AUTORIZAR")
+        negative_prefixes = ("NO", "DENEGAR", "INSEGURO", "PELIGROSO", "RECHAZAR")
+
+        if upper.startswith(affirmative_prefixes):
+            return True, content[:200]
+        if upper.startswith(negative_prefixes):
+            return False, content[:200]
+        # Ambiguo: por seguridad, no preautorizar.
+        return False, f"respuesta ambigua del LLM: {content[:200]}"
+
+    def _log_event(
+        self,
+        task_id: int,
+        event_type: EventType,
+        content: str,
+    ) -> None:
+        """
+        Registra un evento en el historial desde la UI.
+
+        Equivalente a Agent._log pero invocable desde el hilo de la UI
+        (no requiere una referencia al Agent). Escribe en la BD y publica
+        un evento history_update en la cola para refrescar la vista.
+        """
+        self.db.add_history(task_id, event_type, content)
+        self.ui_queue.put(
+            {
+                "type": "history_update",
+                "task_id": task_id,
+                "event_type": event_type.value,
+                "content": content,
+            }
+        )
 
     def _render_current_approval(self) -> None:
         """Renderiza en el panel la primera solicitud pendiente de la cola."""
@@ -3789,6 +4190,272 @@ class Dashboard:
             self.approval_header_var.set(
                 f"⚠ Control de permisos (Human-in-the-Loop) — {pending} solicitudes pendientes"
             )
+
+    # --- Explorador de ficheros del workspace ---
+
+    def _refresh_file_browser(self) -> None:
+        """
+        Recarga el contenido del directorio actual en el explorador.
+
+        Las entradas se muestran ordenadas: primero las carpetas (alfabético),
+        luego los ficheros (alfabético). Cada fila incluye el tamaño formateado.
+        Las entradas especiales "." y ".." se omiten; para subir al directorio
+        padre se usa el botón "⬆ Padre".
+        """
+        # Limpia el treeview.
+        for iid in self.browser_tree.get_children():
+            self.browser_tree.delete(iid)
+
+        current = self._browser_current_dir
+        # Seguridad: nunca salirse del workspace.
+        try:
+            current.relative_to(WORKSPACE_DIR)
+        except ValueError:
+            self._browser_current_dir = WORKSPACE_DIR
+            current = WORKSPACE_DIR
+
+        # Encabezado con la ruta actual.
+        try:
+            display_path = current.relative_to(WORKSPACE_DIR).as_posix()
+        except ValueError:
+            display_path = current.as_posix()
+        if display_path in ("", "."):
+            display_path = "/"
+        else:
+            display_path = "/" + display_path
+        self.browser_title_var.set(f"📁 Explorador: {display_path}")
+
+        if not current.exists() or not current.is_dir():
+            self.browser_tree.insert(
+                "", "end", iid="__missing__", text="(directorio no disponible)",
+                values=("",),
+            )
+            return
+
+        try:
+            entries = sorted(
+                current.iterdir(),
+                key=lambda p: (not p.is_dir(), p.name.lower()),
+            )
+        except OSError as e:
+            self.browser_tree.insert(
+                "", "end", iid="__error__", text=f"(error al leer: {e})",
+                values=("",),
+            )
+            return
+
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    label = f"📁 {entry.name}"
+                    size_text = "—"
+                else:
+                    try:
+                        size_text = _format_size(entry.stat().st_size)
+                    except OSError:
+                        size_text = "?"
+                    label = f"📄 {entry.name}"
+            except OSError:
+                continue
+            # iid = ruta absoluta para identificarla de forma única.
+            self.browser_tree.insert(
+                "", "end", iid=str(entry), text=label, values=(size_text,),
+            )
+
+    def _on_browser_activate(self, _event: Any) -> None:
+        """
+        Maneja doble clic / Enter sobre una entrada del explorador.
+
+        - Si es una carpeta: navega dentro de ella.
+        - Si es un fichero: abre una ventana independiente (Toplevel)
+          con el contenido completo del fichero.
+        """
+        selection = self.browser_tree.selection()
+        if not selection:
+            return
+        iid = selection[0]
+        if iid in ("__missing__", "__error__"):
+            return
+        try:
+            target = Path(iid)
+        except ValueError:
+            return
+        if not target.exists():
+            self._refresh_file_browser()
+            return
+        if target.is_dir():
+            # Seguridad: no salir del workspace.
+            try:
+                target.relative_to(WORKSPACE_DIR)
+            except ValueError:
+                return
+            self._browser_current_dir = target
+            self._refresh_file_browser()
+            return
+        # Fichero: abrir ventana independiente con su contenido.
+        self._open_file_viewer(target)
+
+    def _open_file_viewer(self, target: Path) -> None:
+        """
+        Abre una ventana Toplevel con el contenido del fichero seleccionado.
+
+        La ventana es modal respecto al dashboard (no se puede interactuar
+        con el dashboard mientras está abierta) y muestra la ruta completa
+        en el título junto con el nombre del fichero. El contenido se
+        carga en un ScrolledText de solo lectura. Si el fichero es binario
+        o no se puede decodificar como UTF-8, se muestra un aviso y los
+        primeros bytes en hexadecimal.
+        """
+        try:
+            size = target.stat().st_size
+        except OSError as e:
+            messagebox.showerror(
+                "Error al abrir fichero",
+                f"No se pudo acceder a {target}:\n{e}",
+                parent=self.root,
+            )
+            return
+
+        # Crear ventana Toplevel modal.
+        viewer = Toplevel(self.root)
+        viewer.title(f"📄 {target.name}  —  {target}")
+        viewer.geometry("900x600")
+        viewer.minsize(500, 300)
+        viewer.configure(background=CONFIG.ui_bg_color)
+        viewer.transient(self.root)
+        viewer.grab_set()
+
+        # Cabecera con la ruta completa y el tamaño.
+        header = ttk.Frame(viewer, style="Card.TFrame", padding=8)
+        header.pack(fill="x")
+        try:
+            rel = target.relative_to(WORKSPACE_DIR)
+            rel_text = str(rel)
+        except ValueError:
+            rel_text = str(target)
+        ttk.Label(
+            header,
+            text=f"📁 {rel_text}    ·    {_format_size(size)}",
+            style="Header.TLabel",
+        ).pack(side="left")
+        ttk.Button(
+            header,
+            text="✖ Cerrar",
+            command=viewer.destroy,
+        ).pack(side="right")
+
+        # Contenido del fichero en Text de solo lectura con scroll vertical
+        # y horizontal (las líneas largas no se truncan: se puede desplazar
+        # lateralmente con la barra inferior o con Shift+rueda del ratón).
+        content_frame = ttk.Frame(viewer, style="Card.TFrame")
+        content_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        content_frame.rowconfigure(0, weight=1)
+        content_frame.columnconfigure(0, weight=1)
+
+        content_view = Text(
+            content_frame,
+            wrap="none",
+            font=(CONFIG.ui_mono_font_family, CONFIG.ui_mono_font_size),
+            state="disabled",
+            background=CONFIG.ui_history_bg,
+            foreground=CONFIG.ui_history_fg,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        v_scroll = ttk.Scrollbar(
+            content_frame, orient="vertical", command=content_view.yview
+        )
+        h_scroll = ttk.Scrollbar(
+            content_frame, orient="horizontal", command=content_view.xview
+        )
+        content_view.configure(
+            yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set
+        )
+        content_view.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+
+        # Shift+rueda del ratón → scroll horizontal (más cómodo que la barra).
+        def _on_shift_mousewheel(event: Any) -> None:
+            content_view.xview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        content_view.bind("<Enter>", lambda _e: content_view.bind_all(
+            "<Shift-MouseWheel>", _on_shift_mousewheel
+        ))
+        content_view.bind("<Leave>", lambda _e: content_view.unbind_all(
+            "<Shift-MouseWheel>"
+        ))
+
+        # Cargar contenido.
+        content_view.configure(state="normal")
+        content_view.delete("1.0", "end")
+        if size == 0:
+            content_view.insert("end", "(fichero vacío)")
+        else:
+            try:
+                # Intentar leer como texto UTF-8.
+                content = target.read_text(encoding="utf-8", errors="strict")
+                content_view.insert("end", content)
+            except (UnicodeDecodeError, ValueError):
+                # Fichero binario: mostrar aviso y primeros bytes en hex.
+                content_view.insert(
+                    "end",
+                    f"(fichero binario: {_format_size(size)} — "
+                    f"se muestran los primeros 4096 bytes en hexadecimal)\n\n",
+                )
+                try:
+                    with target.open("rb") as fh:
+                        raw = fh.read(4096)
+                    hex_lines: List[str] = []
+                    for offset in range(0, len(raw), 16):
+                        chunk = raw[offset:offset + 16]
+                        hex_part = " ".join(f"{b:02x}" for b in chunk)
+                        ascii_part = "".join(
+                            chr(b) if 32 <= b < 127 else "." for b in chunk
+                        )
+                        hex_lines.append(f"{offset:08x}  {hex_part:<47}  {ascii_part}")
+                    content_view.insert("end", "\n".join(hex_lines))
+                except OSError as e:
+                    content_view.insert("end", f"(no se pudo leer: {e})")
+            except OSError as e:
+                content_view.insert("end", f"(no se pudo leer: {e})")
+
+        content_view.see("1.0")
+        content_view.configure(state="disabled")
+
+        # Centrar la ventana sobre el dashboard.
+        viewer.update_idletasks()
+        try:
+            root_x = self.root.winfo_rootx()
+            root_y = self.root.winfo_rooty()
+            root_w = self.root.winfo_width()
+            root_h = self.root.winfo_height()
+            vw = viewer.winfo_width()
+            vh = viewer.winfo_height()
+            x = root_x + (root_w - vw) // 2
+            y = root_y + (root_h - vh) // 2
+            viewer.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Cerrar con Escape.
+        viewer.bind("<Escape>", lambda _e: viewer.destroy())
+
+    def _on_browser_up(self) -> None:
+        """Sube al directorio padre (sin salir del workspace)."""
+        current = self._browser_current_dir
+        if current == WORKSPACE_DIR or current.parent == current:
+            return
+        parent = current.parent
+        try:
+            parent.relative_to(WORKSPACE_DIR)
+        except ValueError:
+            # El padre está fuera del workspace: volver a la raíz.
+            self._browser_current_dir = WORKSPACE_DIR
+        else:
+            self._browser_current_dir = parent
+        self._refresh_file_browser()
 
 
 # ============================================================================
