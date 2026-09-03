@@ -14,7 +14,7 @@
 - 🔌 **Modo dual LLM:** local (GGUF con `llama-cpp-python`) o HTTP (OpenAI/Ollama/llama.cpp server).
 - 📊 **Dashboard tkinter** con 4 zonas: prompt, tablero de tareas, historial y panel de aprobación.
 - 💾 **Persistencia SQLite** con borrado en cascada y limpieza al arrancar.
-- 🧪 **Resiliencia probada:** 170+ tests que cubren respuestas malformadas, tareas en paralelo y orquestación de subtareas.
+- 🧪 **Resiliencia probada:** 108+ tests de resiliencia, más suites de funcionamiento en paralelo y orquestación de subtareas.
 - 📦 **Ejecutable autónomo** compilable con Nuitka (cero instalación en el destino).
 
 ## 📦 Requisitos
@@ -29,16 +29,18 @@
 ```bash
 git clone https://github.com/ruben-pastor/gestor-agentes.git
 cd gestor-agentes
-copy config.ini.example config.ini
 python gestor_agentes.py
 ```
+
+El fichero `config.ini` ya viene incluido con valores por defecto; edítalo para ajustar la ruta del modelo GGUF u otros parámetros (ver [Configuración](docs/CONFIGURATION.md)).
 
 ## 🧪 Tests
 
 ```bash
-python test_resilience.py        # 108+ escenarios de resiliencia
-python test_funcionamiento.py    # tareas en paralelo
-python test_subtareas.py         # orquestador de subtareas
+python test_global.py             # ejecuta todas las suites y muestra el resumen
+python test_resilience.py         # 108+ escenarios de resiliencia
+python test_funcionamiento.py     # tareas en paralelo
+python test_subtareas.py          # orquestador de subtareas
 ```
 
 ## 🏗️ Compilar ejecutable

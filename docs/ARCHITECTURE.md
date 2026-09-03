@@ -95,7 +95,7 @@ stateDiagram-v2
 - SQLite nativo con FK `ON DELETE CASCADE`.
 - Índices en `task_id`, `status` y `parent_task_id`.
 - Thread-safety con `threading.Lock` y timeout de 10s.
-- Limpieza de tareas `PENDING`/`IN_PROGRESS` al arrancar.
+- Limpieza de tareas `PENDING`/`IN_PROGRESS`/`AWAITING_APPROVAL` al arrancar.
 - Migración ligera: columnas nuevas se añaden con `ALTER TABLE` si no existen.
 
 ## 4. Mecanismos de resiliencia

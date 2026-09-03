@@ -1,5 +1,15 @@
 # Testing
 
+## Ejecutar todas las suites
+
+`test_global.py` lanza las 3 suites como subprocesos independientes y muestra un resumen global.
+
+```bash
+python test_global.py
+python test_global.py --verbose   # salida completa de cada suite
+python test_global.py --quiet     # solo el resumen final
+```
+
 ## Suites disponibles
 
 ### `test_resilience.py`

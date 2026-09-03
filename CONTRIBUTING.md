@@ -24,11 +24,10 @@ Abre un issue con la etiqueta `enhancement` antes de enviar un PR.
 Antes de enviar un PR:
 
 ```bash
-python test_resilience.py
-python test_funcionamiento.py
+python test_global.py
 ```
 
-Ambos deben pasar al 100%. Añade tests para cualquier bug que corrijas.
+Ejecuta las 3 suites (`test_resilience.py`, `test_funcionamiento.py`, `test_subtareas.py`); todas deben pasar al 100%. Añade tests para cualquier bug que corrijas.
 
 ## Contacto
 

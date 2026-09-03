@@ -1839,8 +1839,8 @@ class LoopDetector:
     Genera una huella estable (fingerprint) de cada mensaje del asistente
     combinando el contenido textual normalizado y la firma de las
     tool_calls (nombre + argumentos ordenados). Cuando la misma huella
-    aparece un nÃºmero de veces igual o superior al umbral, se considera
-    que el modelo estÃ¡ atrapado en un bucle y se debe compactar el
+    aparece un número de veces igual o superior al umbral, se considera
+    que el modelo está atrapado en un bucle y se debe compactar el
     contexto para permitirle replantear la estrategia.
     """
 
