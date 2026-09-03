@@ -42,6 +42,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -79,7 +80,7 @@ class Config:
             "base_url": "http://localhost:8080/v1",
             "api_key": "",
             "model": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-            "model_path": "modelos/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+            "model_path": "modelos",
             "timeout": "120",
             "n_ctx": "8192",
             "n_threads": "8",
@@ -907,11 +908,30 @@ class LLMConnector:
     # --- Backend local (llama-cpp-python) ---
 
     def _resolve_model_file(self) -> Path:
-        """Resuelve la ruta del modelo .gguf (absoluta)."""
+        """
+        Resuelve la ruta del modelo .gguf (absoluta).
+
+        Acepta dos formas de configurar ``model_path`` en config.ini:
+            - Directorio: se le concatena el nombre del modelo (``model``).
+            - Ruta completa al archivo: se respeta tal cual.
+
+        Si la ruta resuelta no existe, lanza ``LLMError`` con un mensaje
+        claro que indica qué campos revisar.
+        """
         p = Path(self.model_path)
         if not p.is_absolute():
             p = SCRIPT_DIR / p
-        return p.resolve()
+        resolved = p.resolve()
+        # Si model_path apunta a un directorio, añadir el nombre del modelo.
+        if resolved.is_dir():
+            resolved = resolved / self.model
+        if not resolved.exists():
+            raise LLMError(
+                f"Archivo de modelo no encontrado: {resolved}. "
+                f"Verifica que 'model' y 'model_path' en config.ini "
+                f"apuntan a un .gguf existente."
+            )
+        return resolved
 
     def _init_local(self) -> None:
         """Carga el modelo GGUF en memoria con llama-cpp-python."""
@@ -1095,17 +1115,250 @@ class LLMConnector:
         return cleaned, tool_calls
 
     @staticmethod
+    def _extract_tool_calls_from_xml(
+        content: str,
+    ) -> Tuple[str, List[ToolCall]]:
+        """
+        Extrae tool_calls del texto cuando el modelo los emite como bloques
+        XML en lugar de JSON o del campo estructurado ``tool_calls``.
+
+        Algunos modelos (Hermes/Mistral en modo XML,某些 fine-tunes, etc.)
+        responden con etiquetas XML en lugar de JSON. Esta función
+        compatibiliza esos formatos convirtiéndolos a la misma estructura
+        ``ToolCall`` que el parser JSON.
+
+        Formatos XML soportados:
+            - ``<tool_call><name>func</name><arguments>...</arguments></tool_call>``
+            - ``<invoke name="func">...</invoke>`` (Hermes/Mistral)
+            - ``<function_call><function name="func">...</function></function_call>``
+            - ``<tool_use><name>func</name><input>...</input></tool_use>``
+            - ``<tool name="func">...</tool>`` (cuando tiene atributo/hijo ``name``)
+
+        El nombre de la función puede estar en un atributo ``name`` o en un
+        elemento hijo ``<name>``. Los argumentos se buscan en ``<arguments>``,
+        ``<input>`` o, en su defecto, en los hijos directos del bloque.
+
+        Devuelve (contenido_limpio, tool_calls). Los bloques que no se
+        puedan parsear como XML válido o que no contengan un nombre de
+        función se conservan en el contenido.
+        """
+        tool_calls: List[ToolCall] = []
+        cleaned_parts: List[str] = []
+        pos = 0
+
+        # Etiquetas raíz que pueden contener tool calls.
+        # ``tool`` se incluye pero solo se acepta si tiene ``name`` (atributo
+        # o hijo) para no capturar HTML u otros ``<tool>`` genéricos.
+        root_tags = (
+            "tool_call", "invoke", "function_call", "tool_use", "tool",
+        )
+
+        while pos < len(content):
+            # Encontrar la siguiente etiqueta raíz candidata más cercana.
+            next_start = -1
+            next_tag: Optional[str] = None
+            for tag in root_tags:
+                open_tag = f"<{tag}"
+                idx = content.find(open_tag, pos)
+                if idx == -1:
+                    continue
+                # Verificar que sea una etiqueta de apertura válida
+                # (seguida de espacio, >, / o whitespace).
+                after_idx = idx + len(open_tag)
+                if after_idx >= len(content):
+                    continue
+                after_char = content[after_idx]
+                if after_char in (" ", ">", "/", "\n", "\t", "\r"):
+                    if next_start == -1 or idx < next_start:
+                        next_start = idx
+                        next_tag = tag
+
+            if next_start == -1 or next_tag is None:
+                cleaned_parts.append(content[pos:])
+                break
+
+            # Texto previo al bloque: se conserva tal cual.
+            cleaned_parts.append(content[pos:next_start])
+
+            # Buscar la etiqueta de cierre correspondiente.
+            close_tag = f"</{next_tag}>"
+            end = content.find(close_tag, next_start)
+            if end == -1:
+                # Sin cierre: dejar el resto intacto y abortar.
+                cleaned_parts.append(content[next_start:])
+                break
+
+            block_end = end + len(close_tag)
+            block = content[next_start:block_end]
+
+            try:
+                # Envolver en un root sintético para que ElementTree
+                # acepte el bloque aunque contenga texto mixto o múltiples
+                # elementos hermanos.
+                wrapped = f"<root>{block}</root>"
+                root = ET.fromstring(wrapped)
+
+                tc_elem = root[0] if len(root) else None
+                if tc_elem is None:
+                    cleaned_parts.append(block)
+                    pos = block_end
+                    continue
+
+                # Extraer nombre: atributo ``name`` o elemento hijo ``<name>``.
+                name = (tc_elem.get("name") or "").strip()
+                name_source = tc_elem
+
+                if not name:
+                    name_elem = tc_elem.find("name")
+                    if name_elem is not None and name_elem.text:
+                        name = name_elem.text.strip()
+
+                # Si no hay nombre en el root, buscar en hijos directos.
+                # Esto cubre el caso ``<function_call><function name="...">``
+                # donde la definición de la función está anidada.
+                if not name:
+                    for child in tc_elem:
+                        child_name = (child.get("name") or "").strip()
+                        if not child_name:
+                            child_name_elem = child.find("name")
+                            if child_name_elem is not None and child_name_elem.text:
+                                child_name = child_name_elem.text.strip()
+                        if child_name:
+                            name = child_name
+                            name_source = child
+                            break
+
+                if not name:
+                    # Sin nombre no es un tool_call válido: conservar bloque.
+                    cleaned_parts.append(block)
+                    pos = block_end
+                    continue
+
+                # Usar el elemento que contiene el nombre como tc_elem
+                # para que los argumentos se extraigan del lugar correcto.
+                tc_elem = name_source
+
+                # Localizar contenedor de argumentos.
+                args_elem = tc_elem.find("arguments")
+                if args_elem is None:
+                    args_elem = tc_elem.find("input")
+                if args_elem is None:
+                    # Si no hay contenedor, usar el propio bloque como args
+                    # y filtrar ``name`` después.
+                    args_elem = tc_elem
+
+                arguments = LLMConnector._xml_element_to_dict(args_elem)
+                # Si args_elem era el propio tc_elem, eliminar ``name`` y
+                # cualquier atributo ``name`` que se haya colado.
+                if args_elem is tc_elem:
+                    arguments.pop("name", None)
+
+                tool_calls.append(
+                    ToolCall(
+                        id=f"call_{uuid.uuid4().hex[:8]}",
+                        name=name,
+                        arguments=arguments,
+                    )
+                )
+                pos = block_end
+            except ET.ParseError:
+                # XML inválido: conservar el bloque en el contenido.
+                cleaned_parts.append(block)
+                pos = block_end
+
+        cleaned = "".join(cleaned_parts).strip()
+        return cleaned, tool_calls
+
+    @staticmethod
+    def _xml_element_to_dict(elem: ET.Element) -> Dict[str, Any]:
+        """
+        Convierte un elemento XML en un diccionario, intentando preservar
+        tipos simples (int, float, bool, None) y arrays cuando hay varios
+        hijos con el mismo tag.
+
+        Reglas:
+            - Atributos del elemento → claves del diccionario.
+            - Hijos con texto plano y sin atributos → valor escalar coerced.
+            - Hijos con hijos o atributos → recursión a dict.
+            - Varios hijos con el mismo tag → lista (array).
+            - Texto que parece JSON (``{`` o ``[`` al inicio) → se intenta
+              parsear como JSON antes de coercing.
+        """
+        result: Dict[str, Any] = {}
+
+        # Atributos del elemento.
+        for attr_name, attr_value in elem.attrib.items():
+            result[attr_name] = LLMConnector._coerce_xml_value(attr_value)
+
+        # Agrupar hijos por tag para detectar arrays.
+        children_by_tag: Dict[str, List[ET.Element]] = {}
+        for child in elem:
+            children_by_tag.setdefault(child.tag, []).append(child)
+
+        for tag, children in children_by_tag.items():
+            if len(children) == 1:
+                child = children[0]
+                if len(child) == 0 and not child.attrib:
+                    text = (child.text or "").strip()
+                    # Si el texto parece JSON, intentar parsearlo.
+                    if text.startswith(("{", "[")):
+                        try:
+                            result[tag] = json.loads(text)
+                            continue
+                        except json.JSONDecodeError:
+                            pass
+                    result[tag] = LLMConnector._coerce_xml_value(text)
+                else:
+                    result[tag] = LLMConnector._xml_element_to_dict(child)
+            else:
+                # Múltiples hijos con el mismo tag → array.
+                result[tag] = [
+                    LLMConnector._xml_element_to_dict(child)
+                    if (len(child) or child.attrib)
+                    else LLMConnector._coerce_xml_value(
+                        (child.text or "").strip()
+                    )
+                    for child in children
+                ]
+
+        return result
+
+    @staticmethod
+    def _coerce_xml_value(text: str) -> Any:
+        """Intenta convertir una cadena a un tipo Python nativo."""
+        if not text:
+            return text
+        lower = text.lower()
+        if lower in ("true", "false"):
+            return lower == "true"
+        if lower in ("null", "none"):
+            return None
+        # Número (int o float).
+        try:
+            if "." in text or "e" in text.lower():
+                return float(text)
+            return int(text)
+        except ValueError:
+            pass
+        return text
+
+    @staticmethod
     def parse_assistant_message(raw: Dict[str, Any]) -> Tuple[str, List[ToolCall]]:
         """
         Extrae contenido textual y tool_calls del mensaje del asistente.
 
-        Soporta dos formatos de tool_calls:
+        Soporta tres formatos de tool_calls:
             1. Estructurado OpenAI: ``message.tool_calls`` (lista de objetos).
-            2. Texto plano: bloques ``<tool_call>{...}</tool_call>`` dentro
-               de ``message.content`` (Qwen3-Instruct y similares).
+            2. Texto plano JSON: bloques ``<tool_call>{...}</tool_call>``
+               dentro de ``message.content`` (Qwen3-Instruct y similares).
+            3. Texto plano XML: bloques ``<tool_call>...</tool_call>``,
+               ``<invoke name="...">...</invoke>``, ``<function_call>...``,
+               ``<tool_use>...</tool_use>`` o ``<tool name="...">...</tool>``
+               (Hermes/Mistral en modo XML y otros modelos que emiten XML
+               en lugar de JSON).
 
         Devuelve (content, tool_calls). Si el LLM no devuelve tool_calls
-        en ninguno de los dos formatos, se devuelve una lista vacía.
+        en ninguno de los formatos, se devuelve una lista vacía.
         """
         try:
             choice = raw["choices"][0]
@@ -1150,6 +1403,14 @@ class LLMConnector:
         if not tool_calls and content:
             content, text_calls = LLMConnector._extract_tool_calls_from_text(content)
             tool_calls = text_calls
+
+            # Segundo fallback: algunos modelos responden con etiquetas XML
+            # en lugar de JSON (Hermes/Mistral en modo XML, etc.). Si el
+            # parser JSON no encontró nada (o conservó bloques no parseables),
+            # intentar extraer tool_calls del XML.
+            if not tool_calls and content:
+                content, xml_calls = LLMConnector._extract_tool_calls_from_xml(content)
+                tool_calls = xml_calls
 
         return content, tool_calls
 
@@ -2035,14 +2296,55 @@ class Agent:
                 if content:
                     self._log(task_id, EventType.THOUGHT, content)
 
+                # Registrar la respuesta del asistente en el historial ANTES
+                # de cualquier otra decisión. Esto es imprescindible para que
+                # la API acepte el historial en la siguiente iteración: si el
+                # modelo responde solo con texto (sin tool_calls), el mensaje
+                # assistant debe estar presente antes de inyectar cualquier
+                # mensaje user (recordatorio). De lo contrario, el historial
+                # queda como [system, user, user] y la API lo rechaza con
+                # "conversation roles must alternate".
+                assistant_msg: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": content or None,
+                }
+                if tool_calls:
+                    assistant_msg["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                            },
+                        }
+                        for tc in tool_calls
+                    ]
+                messages.append(assistant_msg)
+
                 # Si hay tool_calls, ejecutarlos.
                 if tool_calls:
                     tools_were_used = True
                     no_tool_streak = 0
                 else:
-                    # Sin tool_calls: si ya se usaron herramientas antes, es respuesta final.
-                    # Si nunca se usaron, inyectar recordatorio para forzar su uso.
-                    if tools_were_used:
+                    # Sin tool_calls: decidir si es respuesta final válida
+                    # o si hay que forzar el uso de herramientas.
+                    #
+                    # Las subtareas REQUIREMENTS y EXECUTION_VERIFICATION
+                    # están diseñadas para terminar con una respuesta en
+                    # texto puro (documento de requisitos o veredicto de
+                    # verificación). En estos casos, el texto ES la respuesta
+                    # final y NO debemos inyectar recordatorios ni seguir
+                    # iterando.
+                    text_only_subtask_types = {
+                        SubtaskType.REQUIREMENTS,
+                        SubtaskType.EXECUTION_VERIFICATION,
+                    }
+                    allows_text_only_answer = (
+                        task.subtask_type in text_only_subtask_types
+                    )
+
+                    if tools_were_used or allows_text_only_answer:
                         final_answer = content or "(sin contenido)"
                         self._log(task_id, EventType.FINAL_ANSWER, final_answer)
                         self._set_status(
@@ -2080,25 +2382,6 @@ class Agent:
                         }
                     )
                     continue
-
-                # Registrar tool calls y añadirlos al historial de mensajes.
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": content or None,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": json.dumps(tc.arguments, ensure_ascii=False),
-                                },
-                            }
-                            for tc in tool_calls
-                        ],
-                    }
-                )
 
                 for tc in tool_calls:
                     self._log(

@@ -1,4 +1,5 @@
 /.venv
+/venv
 /gestor_agentes.build
 /gestor_agentes.db
 /gestor_agentes.dist
